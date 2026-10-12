@@ -1,0 +1,57 @@
+name: 500mb Ensemble Viewer Automation
+
+on:
+  schedule:
+    # 06:30 UTC captures the 00Z global packages
+    - cron: '30 6 * * *'
+    # 18:30 UTC captures the 12Z global packages
+    - cron: '30 18 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI anytime
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System GIS Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgeos-dev libproj-dev proj-data proj-bin libeccodes-dev
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install herbie-data cartopy cfgrib eccodes xarray scipy matplotlib
+
+      - name: Run 500mb Height Generator
+        run: |
+          python generate_viewer.py
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'output'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
