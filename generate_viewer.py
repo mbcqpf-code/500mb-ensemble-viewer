@@ -24,10 +24,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas projection dimensions
+# Fixed canvas dimensions
 CANVAS_W, CANVAS_H = 1200, 800
 
-# Cycle detector
+# Operational Cycle Detector
 now = datetime.utcnow()
 if (now.hour == 1 and now.minute > 30) or (2 <= now.hour <= 12) or (now.hour == 13 and now.minute <= 30):
     base_date = now - timedelta(days=1)
@@ -39,14 +39,14 @@ else:
 global_init_time = base_date.strftime(f'%Y-%m-%d {global_cycle}:00')
 print(f"📡 Global Model Baseline Cycle: {global_init_time}")
 
-# CONUS domain
+# CONUS Domain
 lon_min, lon_max = -130.0, -60.0
 lat_min, lat_max = 20.0, 55.0
 grid_lats = np.arange(lat_min, lat_max + 0.5, 0.5)
 grid_lons = np.arange(lon_min, lon_max + 0.5, 0.5)
 target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
-# --- 2. GENERATE STATIC BASEMAP ONCE ---
+# --- 2. GENERATE STATIC BASEMAP ---
 print("🗺️ Rendering static Cartopy basemap...")
 fig = plt.figure(figsize=(12, 8), dpi=100)
 ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
@@ -65,52 +65,69 @@ print("✅ Saved basemap.png")
 
 # --- 3. GRID STANDARDIZATION & VECTOR EXTRACTION ---
 def standardize_grid(ds):
-    if ds is None: return None
-    ds = ds.squeeze()
-    var_key = list(ds.data_vars)[0]
-    da = ds[var_key]
-    if da.longitude.max() > 180:
-        da = da.assign_coords(longitude=(((da.longitude + 180) % 360) - 180))
-    da = da.sortby(['latitude', 'longitude'])
-    da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
-    arr = da_interp.values
-    if np.nanmean(arr) > 20000:
-        arr = arr / 9.80665
-    return arr
+    if ds is None:
+        return None
+    if isinstance(ds, list):
+        if len(ds) == 0:
+            return None
+        ds = ds[0]
+    try:
+        ds = ds.squeeze()
+        var_key = list(ds.data_vars)[0]
+        da = ds[var_key]
+        if da.longitude.max() > 180:
+            da = da.assign_coords(longitude=(((da.longitude + 180) % 360) - 180))
+        da = da.sortby(['latitude', 'longitude'])
+        da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
+        arr = da_interp.values
+        if np.nanmean(arr) > 20000:
+            arr = arr / 9.80665
+        return arr
+    except Exception:
+        return None
 
 def extract_contours(grid):
     """Computes contours and converts them to pixel coordinates."""
-    if grid is None: return None
-    cs = ax.contour(target_lons, target_lats, grid, levels=ALL_CONTOURS, transform=ccrs.PlateCarree())
-    result = {}
-    
-    for level, segs in zip(cs.levels, cs.allsegs):
-        if not segs: continue
-        lvl_key = str(int(level))
-        lvl_lines = []
-        for s in segs:
-            disp_coords = ax.transData.transform(s)
-            fig_coords = fig.transFigure.inverted().transform(disp_coords)
-            
-            px = np.round(fig_coords[:, 0] * CANVAS_W).astype(int)
-            py = np.round((1.0 - fig_coords[:, 1]) * CANVAS_H).astype(int)
-            
-            # Simple tolerance decimation to optimize JSON payload
-            pts = []
-            for x, y in zip(px, py):
-                if not pts or (abs(x - pts[-1][0]) >= 2 or abs(y - pts[-1][1]) >= 2):
-                    pts.append([int(x), int(y)])
-            if len(pts) > 1:
-                lvl_lines.append(pts)
-                
-        if lvl_lines:
-            result[lvl_key] = lvl_lines
-            
-    # Clean up Matplotlib collections
-    for coll in cs.collections:
-        coll.remove()
+    if grid is None or np.all(np.isnan(grid)):
+        return None
+    try:
+        cs = ax.contour(target_lons, target_lats, grid, levels=ALL_CONTOURS, transform=ccrs.PlateCarree())
+        result = {}
         
-    return result
+        for level, segs in zip(cs.levels, cs.allsegs):
+            if not segs:
+                continue
+            lvl_key = str(int(level))
+            lvl_lines = []
+            for s in segs:
+                disp_coords = ax.transData.transform(s)
+                fig_coords = fig.transFigure.inverted().transform(disp_coords)
+                
+                px = np.round(fig_coords[:, 0] * CANVAS_W).astype(int)
+                py = np.round((1.0 - fig_coords[:, 1]) * CANVAS_H).astype(int)
+                
+                # Decimate adjacent identical points
+                pts = []
+                for x, y in zip(px, py):
+                    if not pts or (abs(x - pts[-1][0]) >= 2 or abs(y - pts[-1][1]) >= 2):
+                        pts.append([int(x), int(y)])
+                if len(pts) > 1:
+                    lvl_lines.append(pts)
+                    
+            if lvl_lines:
+                result[lvl_key] = lvl_lines
+
+        # Cross-version safe contour cleanup (Matplotlib 3.8+ vs <=3.7)
+        if hasattr(cs, 'remove'):
+            cs.remove()
+        elif hasattr(cs, 'collections'):
+            for coll in cs.collections:
+                coll.remove()
+                
+        return result
+    except Exception as e:
+        print(f"⚠️ Warning in contour extraction: {e}")
+        return None
 
 
 # --- 4. DATA FETCHERS ---
@@ -119,13 +136,15 @@ def fetch_gefs_lead(fxx):
     def _worker(m):
         try:
             H = Herbie(global_init_time, model="gefs", product="atmos.5", member=m, fxx=fxx)
-            return standardize_grid(H.xarray(":HGT:500 mb:"))
+            ds = H.xarray(":HGT:500 mb:")
+            return standardize_grid(ds)
         except Exception:
             return None
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         for res in executor.map(_worker, members):
-            if res is not None and res.ndim == 2: grids.append(res)
+            if res is not None and res.ndim == 2:
+                grids.append(res)
     return grids
 
 def fetch_ifs_ensemble(fxx):
@@ -133,12 +152,14 @@ def fetch_ifs_ensemble(fxx):
     try:
         H = Herbie(global_init_time, model="ifs", product="enfo", fxx=fxx)
         ds_list = H.xarray(":gh:500")
-        if not isinstance(ds_list, list): ds_list = [ds_list]
+        if not isinstance(ds_list, list):
+            ds_list = [ds_list]
         for ds in ds_list:
             g = standardize_grid(ds)
             if g is not None:
                 if g.ndim == 3:
-                    for i in range(g.shape[0]): grids.append(g[i])
+                    for i in range(g.shape[0]):
+                        grids.append(g[i])
                 elif g.ndim == 2:
                     grids.append(g)
     except Exception:
@@ -152,7 +173,8 @@ def fetch_aifs_ensemble(fxx):
         for data_type in ["pf", "cf"]:
             try:
                 ds_list = H.xarray(":z:500:", backend_kwargs={"filter_by_keys": {"dataType": data_type}})
-                if not isinstance(ds_list, list): ds_list = [ds_list]
+                if not isinstance(ds_list, list):
+                    ds_list = [ds_list]
                 for ds in ds_list:
                     var_key = list(ds.data_vars)[0]
                     da = ds[var_key].squeeze()
@@ -161,10 +183,12 @@ def fetch_aifs_ensemble(fxx):
                         m_dim = 'number' if 'number' in dim_names else 'realization'
                         for m_idx in range(len(da[m_dim])):
                             g = standardize_grid(da.isel({m_dim: m_idx}).to_dataset(name=var_key))
-                            if g is not None and g.ndim == 2: grids.append(g)
+                            if g is not None and g.ndim == 2:
+                                grids.append(g)
                     else:
                         g = standardize_grid(da.to_dataset(name=var_key))
-                        if g is not None and g.ndim == 2: grids.append(g)
+                        if g is not None and g.ndim == 2:
+                            grids.append(g)
             except Exception:
                 continue
     except Exception:
@@ -175,9 +199,11 @@ def fetch_deterministic(model_name, product, search_str, fxx):
     try:
         H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
         ds = H.xarray(search_str)
-        if isinstance(ds, list): ds = ds[0]
+        if isinstance(ds, list):
+            ds = ds[0]
         g = standardize_grid(ds)
-        if g is not None and g.ndim == 2: return g
+        if g is not None and g.ndim == 2:
+            return g
     except Exception:
         pass
     return None
@@ -187,9 +213,11 @@ def fetch_aigfs(fxx):
         try:
             H = Herbie(global_init_time, model="aigfs", product="pres", fxx=fxx)
             ds = H.xarray(sq)
-            if isinstance(ds, list): ds = ds[0]
+            if isinstance(ds, list):
+                ds = ds[0]
             g = standardize_grid(ds)
-            if g is not None and g.ndim == 2: return g
+            if g is not None and g.ndim == 2:
+                return g
         except Exception:
             pass
     return None
@@ -204,20 +232,17 @@ for fxx in FXX_STEPS:
     ifs_mems  = fetch_ifs_ensemble(fxx)
     aifs_mems = fetch_aifs_ensemble(fxx)
     
-    # Calculate means
     gefs_mean = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
     ifs_mean  = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
     aifs_mean = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     all_members = gefs_mems + ifs_mems + aifs_mems
     super_mean = np.mean(np.stack(all_members), axis=0) if all_members else None
     
-    # Deterministic models
     det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
     det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
     det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
     det_aigfs = fetch_aigfs(fxx)
     
-    # Convert grids to vector coordinates
     step_data = {
         "fxx": fxx,
         "init": global_init_time,
@@ -328,7 +353,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle" id="cycleSubtitle">Baseline Cycle: {global_init_time}Z | Full 240-Hour Range</div>
+    <div class="subtitle">Baseline Cycle: {global_init_time}Z | Full 240-Hour Range</div>
   </div>
 
   <div class="toolbar">
@@ -393,11 +418,10 @@ html_content = f"""<!DOCTYPE html>
   <script>
     const ALL_CONTOURS = {ALL_CONTOURS};
     const STANDARD_CONTOURS = [5400, 5520, 5640, 5760, 5880];
-    let selectedContours = new Set(ALL_CONTOURS); // Default to all contours
+    let selectedContours = new Set(ALL_CONTOURS);
     let dataCache = {{}};
     let currentStepData = null;
 
-    // Build Contour Chip Selector
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
@@ -444,7 +468,6 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
-    // Load step data JSON
     async function loadStepData() {{
       const fxx = document.getElementById('leadSelect').value;
       if (dataCache[fxx]) {{
@@ -477,7 +500,6 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowRight') step(1);
     }});
 
-    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -494,7 +516,6 @@ html_content = f"""<!DOCTYPE html>
       const showEcmwf = document.getElementById('chk_ecmwf_det').checked;
       const showAifsDet = document.getElementById('chk_aifs_det').checked;
 
-      // Update Header Text Stamp
       document.getElementById('mapTitleStamp').innerHTML = 
         `500 hPa Height (m) | Lead: F${{String(currentStepData.fxx).padStart(3, '0')}}<br>` +
         `Init: ${{currentStepData.init}}Z | Valid: ${{currentStepData.valid}}`;
@@ -524,7 +545,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Ensemble Members
+      // 1. Members
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
           currentStepData.gefs_members.forEach(m => drawLines(m, '#5b9bd5', 0.6, 0.35));
@@ -540,7 +561,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Deterministics (Dashed)
+      // 2. Deterministics
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 1.8, 1.0, true);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
@@ -558,7 +579,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Det', color: '#009933', dash: true }});
       }}
 
-      // 3. Ensemble Means
+      // 3. Means
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0033cc', 2.2, 1.0);
         legendItems.push({{ label: 'GEFS Mean', color: '#0033cc', dash: false }});
@@ -572,12 +593,11 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#196f3d', dash: false }});
       }}
 
-      // 4. Superensemble Mean (Thick Black + Labels)
+      // 4. Superensemble Mean
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.0, 1.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
 
-        // Inline text labels on Super Mean
         ctx.font = 'bold 11px sans-serif';
         ctx.fillStyle = '#000';
         ctx.globalAlpha = 1.0;
@@ -594,7 +614,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Render Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
@@ -604,7 +623,6 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
-    // Initial Load
     loadStepData();
   </script>
 </body>
