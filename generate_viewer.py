@@ -62,6 +62,9 @@ ax.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#888888", linewid
 fig.savefig(os.path.join(OUTPUT_DIR, "basemap.png"), dpi=100)
 print("✅ Saved basemap.png")
 
+# Instantiate PlateCarree to display transform for the GeoAxes
+geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
+
 
 # --- 3. GRID STANDARDIZATION & VECTOR EXTRACTION ---
 def standardize_grid(ds):
@@ -89,7 +92,7 @@ def standardize_grid(ds):
 def extract_contours(grid):
     """Computes contours and converts them to pixel coordinates."""
     if grid is None or np.all(np.isnan(grid)):
-        return None
+        return {}
     try:
         cs = ax.contour(target_lons, target_lats, grid, levels=ALL_CONTOURS, transform=ccrs.PlateCarree())
         result = {}
@@ -100,24 +103,31 @@ def extract_contours(grid):
             lvl_key = str(int(level))
             lvl_lines = []
             for s in segs:
-                disp_coords = ax.transData.transform(s)
+                if len(s) < 2:
+                    continue
+                # Transform PlateCarree (lon, lat) to screen display coordinates
+                disp_coords = geo_trans.transform(s)
+                # Transform screen display to normalized figure coordinates [0, 1]
                 fig_coords = fig.transFigure.inverted().transform(disp_coords)
                 
                 px = np.round(fig_coords[:, 0] * CANVAS_W).astype(int)
                 py = np.round((1.0 - fig_coords[:, 1]) * CANVAS_H).astype(int)
                 
-                # Decimate adjacent identical points
+                # Filter duplicate/adjacent points
                 pts = []
                 for x, y in zip(px, py):
-                    if not pts or (abs(x - pts[-1][0]) >= 2 or abs(y - pts[-1][1]) >= 2):
-                        pts.append([int(x), int(y)])
+                    # Keep point if inside or near canvas bounds
+                    if -50 <= x <= CANVAS_W + 50 and -50 <= y <= CANVAS_H + 50:
+                        if not pts or (abs(x - pts[-1][0]) >= 2 or abs(y - pts[-1][1]) >= 2):
+                            pts.append([int(x), int(y)])
+                            
                 if len(pts) > 1:
                     lvl_lines.append(pts)
                     
             if lvl_lines:
                 result[lvl_key] = lvl_lines
 
-        # Cross-version safe contour cleanup (Matplotlib 3.8+ vs <=3.7)
+        # Cross-version safe contour cleanup
         if hasattr(cs, 'remove'):
             cs.remove()
         elif hasattr(cs, 'collections'):
@@ -127,7 +137,7 @@ def extract_contours(grid):
         return result
     except Exception as e:
         print(f"⚠️ Warning in contour extraction: {e}")
-        return None
+        return {}
 
 
 # --- 4. DATA FETCHERS ---
@@ -243,11 +253,14 @@ for fxx in FXX_STEPS:
     det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
     det_aigfs = fetch_aigfs(fxx)
     
+    super_contours = extract_contours(super_mean)
+    print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
+
     step_data = {
         "fxx": fxx,
         "init": global_init_time,
         "valid": valid_time.strftime('%Y-%m-%d %H:%MZ'),
-        "super_mean": extract_contours(super_mean),
+        "super_mean": super_contours,
         "gefs_mean": extract_contours(gefs_mean),
         "ifs_mean": extract_contours(ifs_mean),
         "aifs_mean": extract_contours(aifs_mean),
