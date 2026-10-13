@@ -7,27 +7,32 @@ from datetime import datetime, timedelta
 import numpy as np
 import xarray as xr
 import matplotlib
-matplotlib.use('Agg')  # Headless backend
+matplotlib.use('Agg')  # Headless backend for automation
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from herbie import Herbie
 
 warnings.filterwarnings('ignore')
 
-# --- 1. DIRECTORIES & CONFIGURATION ---
+# ==============================================================================
+# 1. DIRECTORIES & RUN CONFIGURATION
+# ==============================================================================
 OUTPUT_DIR = "output"
 DATA_DIR = os.path.join(OUTPUT_DIR, "data")
+SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(SPREAD_DIR, exist_ok=True)
 
-# Forecast steps: 0 to 240 hours every 12 hours (21 lead times)
+# 0 to 240 hours every 12 hours (21 forecast steps)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas dimensions
+# Fixed canvas projection dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
-# Operational Cycle Detector
+# Operational 00Z / 12Z baseline cycle detector
 now = datetime.utcnow()
 if (now.hour == 1 and now.minute > 30) or (2 <= now.hour <= 12) or (now.hour == 13 and now.minute <= 30):
     base_date = now - timedelta(days=1)
@@ -39,14 +44,17 @@ else:
 global_init_time = base_date.strftime(f'%Y-%m-%d {global_cycle}:00')
 print(f"📡 Global Model Baseline Cycle: {global_init_time}")
 
-# CONUS Domain
+# Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
 lat_min, lat_max = 20.0, 55.0
 grid_lats = np.arange(lat_min, lat_max + 0.5, 0.5)
 grid_lons = np.arange(lon_min, lon_max + 0.5, 0.5)
 target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
-# --- 2. GENERATE STATIC BASEMAP ---
+
+# ==============================================================================
+# 2. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
+# ==============================================================================
 print("🗺️ Rendering static Cartopy basemap...")
 fig = plt.figure(figsize=(12, 8), dpi=100)
 ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
@@ -62,11 +70,13 @@ ax.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#888888", linewid
 fig.savefig(os.path.join(OUTPUT_DIR, "basemap.png"), dpi=100)
 print("✅ Saved basemap.png")
 
-# Instantiate PlateCarree to display transform for the GeoAxes
+# Transform mapping PlateCarree (lon, lat) -> Screen Pixel Coordinates
 geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
 
 
-# --- 3. GRID STANDARDIZATION & VECTOR EXTRACTION ---
+# ==============================================================================
+# 3. GRID STANDARDIZATION & VECTOR EXTRACTION
+# ==============================================================================
 def standardize_grid(ds):
     if ds is None:
         return None
@@ -83,6 +93,7 @@ def standardize_grid(ds):
         da = da.sortby(['latitude', 'longitude'])
         da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
         arr = da_interp.values
+        # Unit conversion: if geopotential (m^2/s^2 ~ 50,000+), convert to gpm
         if np.nanmean(arr) > 20000:
             arr = arr / 9.80665
         return arr
@@ -96,7 +107,6 @@ def extract_contours(grid):
     try:
         cs = ax.contour(target_lons, target_lats, grid, levels=ALL_CONTOURS, transform=ccrs.PlateCarree())
         result = {}
-        
         for level, segs in zip(cs.levels, cs.allsegs):
             if not segs:
                 continue
@@ -105,58 +115,82 @@ def extract_contours(grid):
             for s in segs:
                 if len(s) < 2:
                     continue
-                # Transform PlateCarree (lon, lat) to screen display coordinates
                 disp_coords = geo_trans.transform(s)
-                # Transform screen display to normalized figure coordinates [0, 1]
                 fig_coords = fig.transFigure.inverted().transform(disp_coords)
                 
                 px = np.round(fig_coords[:, 0] * CANVAS_W).astype(int)
                 py = np.round((1.0 - fig_coords[:, 1]) * CANVAS_H).astype(int)
                 
-                # Filter duplicate/adjacent points
                 pts = []
                 for x, y in zip(px, py):
-                    # Keep point if inside or near canvas bounds
                     if -50 <= x <= CANVAS_W + 50 and -50 <= y <= CANVAS_H + 50:
                         if not pts or (abs(x - pts[-1][0]) >= 2 or abs(y - pts[-1][1]) >= 2):
                             pts.append([int(x), int(y)])
-                            
                 if len(pts) > 1:
                     lvl_lines.append(pts)
-                    
             if lvl_lines:
                 result[lvl_key] = lvl_lines
 
-        # Cross-version safe contour cleanup
         if hasattr(cs, 'remove'):
             cs.remove()
         elif hasattr(cs, 'collections'):
             for coll in cs.collections:
                 coll.remove()
-                
         return result
-    except Exception as e:
-        print(f"⚠️ Warning in contour extraction: {e}")
+    except Exception:
         return {}
 
 
-# --- 4. DATA FETCHERS ---
+# ==============================================================================
+# 4. DATA FETCHERS (BALANCED 2x2 ENSEMBLE + DETERMINISTICS)
+# ==============================================================================
+# 1. GEFS (Physics - NCEP)
 def fetch_gefs_lead(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
     def _worker(m):
         try:
             H = Herbie(global_init_time, model="gefs", product="atmos.5", member=m, fxx=fxx)
-            ds = H.xarray(":HGT:500 mb:")
-            return standardize_grid(ds)
+            return standardize_grid(H.xarray(":HGT:500 mb:"))
         except Exception:
             return None
     grids = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
             if res is not None and res.ndim == 2:
                 grids.append(res)
     return grids
 
+# 2. AIGEFS (AI Emulator - NCEP)
+def fetch_aigefs_ensemble(fxx):
+    members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
+    def _worker(m):
+        for sq in [":HGT:500 mb:", ":HGT:500:"]:
+            try:
+                H = Herbie(global_init_time, model="aigefs", product="pres", member=m, fxx=fxx)
+                ds = H.xarray(sq)
+                return standardize_grid(ds)
+            except Exception:
+                continue
+        return None
+    grids = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for res in executor.map(_worker, members):
+            if res is not None and res.ndim == 2:
+                grids.append(res)
+                
+    # Fallback to ensemble mean if individual members are pending
+    if not grids:
+        try:
+            H_mean = Herbie(global_init_time, model="aigefs", product="pres", member="avg", fxx=fxx)
+            ds = H_mean.xarray(":HGT:500 mb:")
+            g = standardize_grid(ds)
+            if g is not None:
+                grids.append(g)
+        except Exception:
+            pass
+    return grids
+
+# 3. ECMWF IFS ENS (Physics - ECMWF)
 def fetch_ifs_ensemble(fxx):
     grids = []
     try:
@@ -176,6 +210,7 @@ def fetch_ifs_ensemble(fxx):
         pass
     return grids
 
+# 4. AIFS ENS (AI Emulator - ECMWF)
 def fetch_aifs_ensemble(fxx):
     grids = []
     try:
@@ -205,6 +240,7 @@ def fetch_aifs_ensemble(fxx):
         pass
     return grids
 
+# Deterministic Fetchers
 def fetch_deterministic(model_name, product, search_str, fxx):
     try:
         H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
@@ -233,26 +269,127 @@ def fetch_aigfs(fxx):
     return None
 
 
-# --- 5. BATCH PRODUCTION LOOP ---
+# ==============================================================================
+# 5. SPREAD & DISAGREEMENT UNDERLAY ENGINE
+# ==============================================================================
+SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m spread intervals
+SPREAD_CMAP = plt.cm.YlOrRd
+
+def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
+    """Calculates internal intra-spreads, pooled intra-spread, and inter-model disagreement."""
+    def calc_spread(mem_list):
+        if len(mem_list) > 1:
+            return np.std(np.stack(mem_list), axis=0, ddof=1)
+        return None
+
+    spr_gefs = calc_spread(gefs_mems)
+    spr_aigefs = calc_spread(aigefs_mems)
+    spr_ifs = calc_spread(ifs_mems)
+    spr_aifs = calc_spread(aifs_mems)
+
+    # Calculate system means and collect internal variances
+    means = []
+    intra_vars = []
+    for mems, spr in [(gefs_mems, spr_gefs), (aigefs_mems, spr_aigefs), 
+                      (ifs_mems, spr_ifs), (aifs_mems, spr_aifs)]:
+        if mems:
+            means.append(np.mean(np.stack(mems), axis=0))
+        if spr is not None:
+            intra_vars.append(spr**2)
+
+    # Inter-Model Disagreement (Variance among active ensemble means)
+    if len(means) > 1:
+        spr_inter = np.std(np.stack(means), axis=0, ddof=1)
+    else:
+        spr_inter = np.zeros_like(target_lats)
+
+    # Pooled Internal Chaos
+    if intra_vars:
+        spr_intra_pooled = np.sqrt(np.mean(np.stack(intra_vars), axis=0))
+    else:
+        spr_intra_pooled = np.zeros_like(target_lats)
+
+    # Total Superensemble Spread
+    all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
+    if len(all_members) > 1:
+        spr_total = np.std(np.stack(all_members), axis=0, ddof=1)
+    else:
+        spr_total = np.zeros_like(target_lats)
+
+    return {
+        "total": spr_total,
+        "inter": spr_inter,
+        "intra_pooled": spr_intra_pooled,
+        "gefs": spr_gefs,
+        "aigefs": spr_aigefs,
+        "ifs": spr_ifs,
+        "aifs": spr_aifs
+    }
+
+def render_spread_underlay(spread_grid, filename):
+    """Renders shaded background contours matching basemap dimensions."""
+    if spread_grid is None or np.all(np.isnan(spread_grid)):
+        return
+    fig_spr = plt.figure(figsize=(12, 8), dpi=100)
+    ax_spr = fig_spr.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
+    ax_spr.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    ax_spr.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax_spr.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
+    
+    # Render shaded contours
+    ax_spr.contourf(
+        target_lons, target_lats, spread_grid,
+        levels=SPREAD_LEVELS, cmap=SPREAD_CMAP,
+        transform=ccrs.PlateCarree(), extend='max', alpha=0.85
+    )
+    
+    ax_spr.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
+    ax_spr.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
+    ax_spr.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
+    ax_spr.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
+
+    fig_spr.savefig(os.path.join(SPREAD_DIR, filename), dpi=100)
+    plt.close(fig_spr)
+
+
+# ==============================================================================
+# 6. BATCH PRODUCTION LOOP
+# ==============================================================================
 for fxx in FXX_STEPS:
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    gefs_mems = fetch_gefs_lead(fxx)
-    ifs_mems  = fetch_ifs_ensemble(fxx)
-    aifs_mems = fetch_aifs_ensemble(fxx)
+    # 1. Fetch all 4 ensembles
+    gefs_mems   = fetch_gefs_lead(fxx)
+    aigefs_mems = fetch_aigefs_ensemble(fxx)
+    ifs_mems    = fetch_ifs_ensemble(fxx)
+    aifs_mems   = fetch_aifs_ensemble(fxx)
+
+    print(f"  ↳ Members loaded: GEFS={len(gefs_mems)}, AIGEFS={len(aigefs_mems)}, IFS={len(ifs_mems)}, AIFS={len(aifs_mems)}")
+
+    # 2. Compute means
+    gefs_mean   = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
+    aigefs_mean = np.mean(np.stack(aigefs_mems), axis=0) if aigefs_mems else None
+    ifs_mean    = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
+    aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     
-    gefs_mean = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
-    ifs_mean  = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
-    aifs_mean = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
-    all_members = gefs_mems + ifs_mems + aifs_mems
-    super_mean = np.mean(np.stack(all_members), axis=0) if all_members else None
-    
+    all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
+    super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
+
+    # 3. Compute and render Spread Underlays
+    spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
+    for spr_key, spr_grid in spread_diags.items():
+        if spr_grid is not None:
+            render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png")
+
+    # 4. Fetch deterministics
     det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
     det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
     det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
     det_aigfs = fetch_aigfs(fxx)
-    
+
+    # 5. Extract vector contours
     super_contours = extract_contours(super_mean)
     print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
@@ -262,17 +399,19 @@ for fxx in FXX_STEPS:
         "valid": valid_time.strftime('%Y-%m-%d %H:%MZ'),
         "super_mean": super_contours,
         "gefs_mean": extract_contours(gefs_mean),
+        "aigefs_mean": extract_contours(aigefs_mean),
         "ifs_mean": extract_contours(ifs_mean),
         "aifs_mean": extract_contours(aifs_mean),
         "gfs_det": extract_contours(det_gfs),
+        "aigfs_det": extract_contours(det_aigfs),
         "ecmwf_det": extract_contours(det_ifs),
         "aifs_det": extract_contours(det_aifs),
-        "aigfs_det": extract_contours(det_aigfs),
         "gefs_members": [extract_contours(m) for m in gefs_mems],
+        "aigefs_members": [extract_contours(m) for m in aigefs_mems],
         "ifs_members": [extract_contours(m) for m in ifs_mems],
         "aifs_members": [extract_contours(m) for m in aifs_mems]
     }
-    
+
     json_path = os.path.join(DATA_DIR, f"f{fxx:03d}.json")
     with open(json_path, "w") as f:
         json.dump(step_data, f, separators=(',', ':'))
@@ -280,7 +419,9 @@ for fxx in FXX_STEPS:
 plt.close(fig)
 
 
-# --- 6. WRITE INTERACTIVE HTML/JS FRONTEND ---
+# ==============================================================================
+# 7. GENERATE DYNAMIC HTML FRONTEND
+# ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -345,19 +486,30 @@ html_content = f"""<!DOCTYPE html>
     #contourCanvas {{ pointer-events: none; }}
     
     .legend-box {{
-      position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.92);
+      position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
       color: #111; padding: 8px 12px; border-radius: 6px; font-size: 12px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 4px;
-      pointer-events: none; max-width: 220px;
+      pointer-events: none; max-width: 240px;
     }}
     .legend-line {{ display: flex; align-items: center; gap: 8px; }}
     .line-sample {{ width: 22px; height: 3px; display: inline-block; }}
 
     .title-stamp {{
-      position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.92);
+      position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.94);
       color: #111; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: bold;
       pointer-events: none; line-height: 1.3;
     }}
+    
+    /* Spread Colorbar Strip */
+    .spread-colorbar {{
+      display: none; align-items: center; gap: 8px; font-size: 11px;
+    }}
+    .colorbar-gradient {{
+      width: 140px; height: 12px; border-radius: 3px;
+      background: linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026);
+      border: 1px solid var(--border);
+    }}
+
     .footer {{ margin: 15px 0 30px 0; font-size: 12px; color: var(--text-muted); }}
     kbd {{ background: #334155; padding: 2px 5px; border-radius: 4px; font-size: 11px; }}
   </style>
@@ -370,7 +522,7 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Lead Scrubbing & View Mode -->
+    <!-- Row 1: Forecast Lead, Display Mode, and Background Shading -->
     <div class="row">
       <div style="display: flex; gap: 8px; align-items: center;">
         <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
@@ -382,16 +534,37 @@ html_content = f"""<!DOCTYPE html>
 
       <div style="display: flex; gap: 14px; align-items: center;">
         <b>Display Mode:</b>
-        <label><input type="radio" name="displayMode" value="spaghetti" checked onchange="draw()"> All Members (Spaghetti) + Means</label>
+        <label><input type="radio" name="displayMode" value="spaghetti" checked onchange="draw()"> Spaghetti + Means</label>
         <label><input type="radio" name="displayMode" value="means" onchange="draw()"> Means Only</label>
+      </div>
+
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <b>Underlay:</b>
+        <select id="bgSelect" onchange="updateBackground()">
+          <option value="none">Basemap Only</option>
+          <option value="inter">Inter-Model Disagreement (σ_inter)</option>
+          <option value="total">Total Super Spread (σ_total)</option>
+          <option value="intra_pooled">Pooled Internal Chaos (σ_intra)</option>
+          <option value="gefs">GEFS Spread</option>
+          <option value="aigefs">AIGEFS Spread</option>
+          <option value="ifs">ECMWF IFS Spread</option>
+          <option value="aifs">AIFS Spread</option>
+        </select>
+
+        <div class="spread-colorbar" id="cbarBox">
+          <span>10m</span>
+          <div class="colorbar-gradient"></div>
+          <span>120m+</span>
+        </div>
       </div>
     </div>
 
-    <!-- Row 2: Model & Ensemble Toggles -->
+    <!-- Row 2: Ensemble & Deterministic Toggles -->
     <div class="checkbox-group">
       <b>Models:</b>
       <label class="checkbox-item"><input type="checkbox" id="chk_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super Mean</label>
       <label class="checkbox-item"><input type="checkbox" id="chk_gefs" checked onchange="draw()"><span class="swatch" style="background:#0033cc;"></span> GEFS</label>
+      <label class="checkbox-item"><input type="checkbox" id="chk_aigefs" checked onchange="draw()"><span class="swatch" style="background:#6c3483;"></span> AIGEFS</label>
       <label class="checkbox-item"><input type="checkbox" id="chk_ifs" checked onchange="draw()"><span class="swatch" style="background:#c0392b;"></span> ECMWF IFS</label>
       <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#196f3d;"></span> AIFS</label>
       <label class="checkbox-item"><input type="checkbox" id="chk_gfs" checked onchange="draw()"><span class="swatch" style="background:#001155; border-bottom: 2px dashed #fff;"></span> GFS Det</label>
@@ -414,7 +587,7 @@ html_content = f"""<!DOCTYPE html>
 
   <!-- Map Card -->
   <div class="viewer-card">
-    <img src="basemap.png" alt="CONUS Basemap">
+    <img id="mapUnderlay" src="basemap.png" alt="CONUS Basemap">
     <canvas id="contourCanvas" width="1200" height="800"></canvas>
     
     <div class="title-stamp" id="mapTitleStamp">
@@ -425,7 +598,7 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> arrow keys to step forecast lead times.
+    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> arrow keys to scrub forecast lead times.
   </div>
 
   <script>
@@ -435,6 +608,7 @@ html_content = f"""<!DOCTYPE html>
     let dataCache = {{}};
     let currentStepData = null;
 
+    // Contour Selector Chips
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
@@ -481,8 +655,27 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
+    // Underlay Management
+    function updateBackground() {{
+      const bg = document.getElementById('bgSelect').value;
+      const fxx = document.getElementById('leadSelect').value;
+      const img = document.getElementById('mapUnderlay');
+      const cbar = document.getElementById('cbarBox');
+
+      if (bg === 'none') {{
+        img.src = 'basemap.png';
+        cbar.style.display = 'none';
+      }} else {{
+        img.src = `spread/${{bg}}_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+      }}
+    }}
+
+    // Load Step Data
     async function loadStepData() {{
       const fxx = document.getElementById('leadSelect').value;
+      updateBackground();
+
       if (dataCache[fxx]) {{
         currentStepData = dataCache[fxx];
         draw();
@@ -513,6 +706,7 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowRight') step(1);
     }});
 
+    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -522,6 +716,7 @@ html_content = f"""<!DOCTYPE html>
       const isSpaghetti = document.querySelector('input[name="displayMode"]:checked').value === 'spaghetti';
       const showSuper = document.getElementById('chk_super').checked;
       const showGefs = document.getElementById('chk_gefs').checked;
+      const showAigefs = document.getElementById('chk_aigefs').checked;
       const showIfs = document.getElementById('chk_ifs').checked;
       const showAifs = document.getElementById('chk_aifs').checked;
       const showGfs = document.getElementById('chk_gfs').checked;
@@ -558,11 +753,15 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Members
+      // 1. Members (Spaghetti)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
           currentStepData.gefs_members.forEach(m => drawLines(m, '#5b9bd5', 0.6, 0.35));
           legendItems.push({{ label: `GEFS Members (${{currentStepData.gefs_members.length}})`, color: '#5b9bd5', dash: false }});
+        }}
+        if (showAigefs && currentStepData.aigefs_members) {{
+          currentStepData.aigefs_members.forEach(m => drawLines(m, '#bb8fce', 0.6, 0.35));
+          legendItems.push({{ label: `AIGEFS Members (${{currentStepData.aigefs_members.length}})`, color: '#bb8fce', dash: false }});
         }}
         if (showIfs && currentStepData.ifs_members) {{
           currentStepData.ifs_members.forEach(m => drawLines(m, '#f1948a', 0.6, 0.35));
@@ -574,7 +773,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Deterministics
+      // 2. Deterministics (Dashed)
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 1.8, 1.0, true);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
@@ -592,10 +791,14 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Det', color: '#009933', dash: true }});
       }}
 
-      // 3. Means
+      // 3. Ensemble Means
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0033cc', 2.2, 1.0);
         legendItems.push({{ label: 'GEFS Mean', color: '#0033cc', dash: false }});
+      }}
+      if (showAigefs && currentStepData.aigefs_mean) {{
+        drawLines(currentStepData.aigefs_mean, '#6c3483', 2.2, 1.0);
+        legendItems.push({{ label: 'AIGEFS Mean', color: '#6c3483', dash: false }});
       }}
       if (showIfs && currentStepData.ifs_mean) {{
         drawLines(currentStepData.ifs_mean, '#c0392b', 2.2, 1.0);
@@ -627,6 +830,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
+      // Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
