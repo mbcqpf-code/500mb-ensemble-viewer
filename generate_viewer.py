@@ -7,9 +7,8 @@ from datetime import datetime, timedelta
 import numpy as np
 import xarray as xr
 import matplotlib
-matplotlib.use('Agg')  # Headless backend for automation
+matplotlib.use('Agg')  # Headless backend
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from herbie import Herbie
@@ -25,14 +24,14 @@ SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(SPREAD_DIR, exist_ok=True)
 
-# 0 to 240 hours every 12 hours (21 forecast steps)
+# 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
 # Fixed canvas projection dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
-# Operational 00Z / 12Z baseline cycle detector
+# Operational Cycle Detector
 now = datetime.utcnow()
 if (now.hour == 1 and now.minute > 30) or (2 <= now.hour <= 12) or (now.hour == 13 and now.minute <= 30):
     base_date = now - timedelta(days=1)
@@ -93,7 +92,6 @@ def standardize_grid(ds):
         da = da.sortby(['latitude', 'longitude'])
         da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
         arr = da_interp.values
-        # Unit conversion: if geopotential (m^2/s^2 ~ 50,000+), convert to gpm
         if np.nanmean(arr) > 20000:
             arr = arr / 9.80665
         return arr
@@ -160,34 +158,30 @@ def fetch_gefs_lead(fxx):
                 grids.append(res)
     return grids
 
-# 2. AIGEFS (AI Emulator - NCEP)
+# 2. AIGEFS (AI Emulator - NCEP) - FIXED FOR NCEP / NOMADS / AWS MEMBER SCHEME
 def fetch_aigefs_ensemble(fxx):
-    members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
-    def _worker(m):
-        for sq in [":HGT:500 mb:", ":HGT:500:"]:
-            try:
-                H = Herbie(global_init_time, model="aigefs", product="pres", member=m, fxx=fxx)
-                ds = H.xarray(sq)
-                return standardize_grid(ds)
-            except Exception:
-                continue
+    def _worker(m_idx):
+        # NCEP AIGEFS uses integers 0..30 or strings mem001..mem030
+        lookup_keys = [m_idx, f"mem{str(m_idx).zfill(3)}"] if m_idx > 0 else [0, "c00", "mem000"]
+        for mem_key in lookup_keys:
+            for sq in [":HGT:500 mb:", ":HGT:500:"]:
+                try:
+                    H = Herbie(global_init_time, model="aigefs", product="pres", member=mem_key, fxx=fxx)
+                    ds = H.xarray(sq)
+                    grid = standardize_grid(ds)
+                    if grid is not None and grid.ndim == 2:
+                        return grid
+                except Exception:
+                    continue
         return None
+
     grids = []
+    # Query control (0) and perturbed members 1 through 30
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        for res in executor.map(_worker, members):
+        for res in executor.map(_worker, list(range(0, 31))):
             if res is not None and res.ndim == 2:
                 grids.append(res)
-                
-    # Fallback to ensemble mean if individual members are pending
-    if not grids:
-        try:
-            H_mean = Herbie(global_init_time, model="aigefs", product="pres", member="avg", fxx=fxx)
-            ds = H_mean.xarray(":HGT:500 mb:")
-            g = standardize_grid(ds)
-            if g is not None:
-                grids.append(g)
-        except Exception:
-            pass
+
     return grids
 
 # 3. ECMWF IFS ENS (Physics - ECMWF)
@@ -272,7 +266,7 @@ def fetch_aigfs(fxx):
 # ==============================================================================
 # 5. SPREAD & DISAGREEMENT UNDERLAY ENGINE
 # ==============================================================================
-SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m spread intervals
+SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m intervals
 SPREAD_CMAP = plt.cm.YlOrRd
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
@@ -287,7 +281,6 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     spr_ifs = calc_spread(ifs_mems)
     spr_aifs = calc_spread(aifs_mems)
 
-    # Calculate system means and collect internal variances
     means = []
     intra_vars = []
     for mems, spr in [(gefs_mems, spr_gefs), (aigefs_mems, spr_aigefs), 
@@ -337,7 +330,6 @@ def render_spread_underlay(spread_grid, filename):
     ax_spr.add_feature(cfeature.LAND, facecolor="#f8f9fa")
     ax_spr.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
     
-    # Render shaded contours
     ax_spr.contourf(
         target_lons, target_lats, spread_grid,
         levels=SPREAD_LEVELS, cmap=SPREAD_CMAP,
@@ -360,7 +352,7 @@ for fxx in FXX_STEPS:
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    # 1. Fetch all 4 ensembles
+    # 1. Fetch ensembles
     gefs_mems   = fetch_gefs_lead(fxx)
     aigefs_mems = fetch_aigefs_ensemble(fxx)
     ifs_mems    = fetch_ifs_ensemble(fxx)
@@ -459,16 +451,29 @@ html_content = f"""<!DOCTYPE html>
     }}
     .btn:hover {{ filter: brightness(1.15); }}
     .btn-secondary {{ background: #475569; }}
+    .btn-micro {{ background: #334155; padding: 2px 7px; font-size: 11px; border-radius: 4px; }}
+    .btn-micro:hover {{ background: #475569; }}
+    
     select {{
       padding: 6px 10px; border-radius: 6px; background: #0f172a; color: white;
       border: 1px solid var(--border); font-size: 13px; cursor: pointer;
     }}
-    
-    .checkbox-group {{ display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13px; }}
-    .checkbox-item {{ display: flex; align-items: center; gap: 6px; cursor: pointer; }}
+
+    /* Structured Model Groups */
+    .model-group-row {{
+      display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px;
+    }}
+    .group-line {{
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px;
+    }}
+    .group-label {{
+      font-weight: bold; min-width: 130px; display: flex; align-items: center; gap: 6px;
+    }}
+    .checkbox-item {{ display: flex; align-items: center; gap: 6px; cursor: pointer; margin-right: 6px; }}
     .swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
-    
-    .contour-section {{ border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }}
+
+    /* Contour Level Chips */
+    .contour-section {{ border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
     .contour-chips {{ display: flex; flex-wrap: wrap; gap: 5px; max-height: 80px; overflow-y: auto; }}
     .chip {{
       background: #0f172a; border: 1px solid var(--border); color: #cbd5e1;
@@ -489,7 +494,7 @@ html_content = f"""<!DOCTYPE html>
       position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
       color: #111; padding: 8px 12px; border-radius: 6px; font-size: 12px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 4px;
-      pointer-events: none; max-width: 240px;
+      pointer-events: none; max-width: 250px;
     }}
     .legend-line {{ display: flex; align-items: center; gap: 8px; }}
     .line-sample {{ width: 22px; height: 3px; display: inline-block; }}
@@ -500,12 +505,11 @@ html_content = f"""<!DOCTYPE html>
       pointer-events: none; line-height: 1.3;
     }}
     
-    /* Spread Colorbar Strip */
     .spread-colorbar {{
       display: none; align-items: center; gap: 8px; font-size: 11px;
     }}
     .colorbar-gradient {{
-      width: 140px; height: 12px; border-radius: 3px;
+      width: 130px; height: 12px; border-radius: 3px;
       background: linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026);
       border: 1px solid var(--border);
     }}
@@ -522,7 +526,7 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Forecast Lead, Display Mode, and Background Shading -->
+    <!-- Row 1: Forecast Lead, Display Mode, and Underlay Shading -->
     <div class="row">
       <div style="display: flex; gap: 8px; align-items: center;">
         <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
@@ -559,18 +563,34 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 2: Ensemble & Deterministic Toggles -->
-    <div class="checkbox-group">
-      <b>Models:</b>
-      <label class="checkbox-item"><input type="checkbox" id="chk_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super Mean</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_gefs" checked onchange="draw()"><span class="swatch" style="background:#0033cc;"></span> GEFS</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_aigefs" checked onchange="draw()"><span class="swatch" style="background:#6c3483;"></span> AIGEFS</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_ifs" checked onchange="draw()"><span class="swatch" style="background:#c0392b;"></span> ECMWF IFS</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#196f3d;"></span> AIFS</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_gfs" checked onchange="draw()"><span class="swatch" style="background:#001155; border-bottom: 2px dashed #fff;"></span> GFS Det</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_aigfs" checked onchange="draw()"><span class="swatch" style="background:#8e44ad; border-bottom: 2px dashed #fff;"></span> AIGFS Det</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_ecmwf_det" onchange="draw()"><span class="swatch" style="background:#990000; border-bottom: 2px dashed #fff;"></span> IFS Det</label>
-      <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"><span class="swatch" style="background:#009933; border-bottom: 2px dashed #fff;"></span> AIFS Det</label>
+    <!-- Row 2: Structured Model Toggles (Ensembles vs Deterministics) -->
+    <div class="model-group-row">
+      <!-- Ensemble Systems & Means -->
+      <div class="group-line">
+        <span class="group-label">
+          Ensembles & Means:
+          <button class="btn btn-micro" onclick="setGroup('ens', true)">All</button>
+          <button class="btn btn-micro" onclick="setGroup('ens', false)">None</button>
+        </span>
+        <label class="checkbox-item"><input type="checkbox" id="chk_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super Mean</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_gefs" checked onchange="draw()"><span class="swatch" style="background:#0044ff;"></span> GEFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aigefs" checked onchange="draw()"><span class="swatch" style="background:#8e44ad;"></span> AIGEFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_ifs" checked onchange="draw()"><span class="swatch" style="background:#d63031;"></span> ECMWF IFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
+      </div>
+
+      <!-- Deterministic Models -->
+      <div class="group-line">
+        <span class="group-label">
+          Deterministics:
+          <button class="btn btn-micro" onclick="setGroup('det', true)">All</button>
+          <button class="btn btn-micro" onclick="setGroup('det', false)">None</button>
+        </span>
+        <label class="checkbox-item"><input type="checkbox" id="chk_gfs" checked onchange="draw()"><span class="swatch" style="background:#001155; border-bottom: 2px dashed #fff;"></span> GFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aigfs" checked onchange="draw()"><span class="swatch" style="background:#4a235a; border-bottom: 2px dashed #fff;"></span> AIGFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_ecmwf_det" onchange="draw()"><span class="swatch" style="background:#78281f; border-bottom: 2px dashed #fff;"></span> IFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"><span class="swatch" style="background:#145a32; border-bottom: 2px dashed #fff;"></span> AIFS Det</label>
+      </div>
     </div>
 
     <!-- Row 3: Height Contours (4980 to 6000m) -->
@@ -652,6 +672,20 @@ html_content = f"""<!DOCTYPE html>
         const chip = document.getElementById(`chip_${{lvl}}`);
         if (chip) chip.classList.add('active');
       }});
+      draw();
+    }}
+
+    // Group Selection Helpers (All / None)
+    function setGroup(grp, state) {{
+      if (grp === 'ens') {{
+        ['chk_super', 'chk_gefs', 'chk_aigefs', 'chk_ifs', 'chk_aifs'].forEach(id => {{
+          document.getElementById(id).checked = state;
+        }});
+      }} else if (grp === 'det') {{
+        ['chk_gfs', 'chk_aigfs', 'chk_ecmwf_det', 'chk_aifs_det'].forEach(id => {{
+          document.getElementById(id).checked = state;
+        }});
+      }}
       draw();
     }}
 
@@ -753,65 +787,65 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Members (Spaghetti)
+      // 1. Members (Spaghetti) - Brightened colors, increased width (0.9) & opacity (0.55)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
-          currentStepData.gefs_members.forEach(m => drawLines(m, '#5b9bd5', 0.6, 0.35));
-          legendItems.push({{ label: `GEFS Members (${{currentStepData.gefs_members.length}})`, color: '#5b9bd5', dash: false }});
+          currentStepData.gefs_members.forEach(m => drawLines(m, '#2980b9', 0.9, 0.55));
+          legendItems.push({{ label: `GEFS Members (${{currentStepData.gefs_members.length}})`, color: '#2980b9', dash: false }});
         }}
         if (showAigefs && currentStepData.aigefs_members) {{
-          currentStepData.aigefs_members.forEach(m => drawLines(m, '#bb8fce', 0.6, 0.35));
-          legendItems.push({{ label: `AIGEFS Members (${{currentStepData.aigefs_members.length}})`, color: '#bb8fce', dash: false }});
+          currentStepData.aigefs_members.forEach(m => drawLines(m, '#9b59b6', 0.9, 0.55));
+          legendItems.push({{ label: `AIGEFS Members (${{currentStepData.aigefs_members.length}})`, color: '#9b59b6', dash: false }});
         }}
         if (showIfs && currentStepData.ifs_members) {{
-          currentStepData.ifs_members.forEach(m => drawLines(m, '#f1948a', 0.6, 0.35));
-          legendItems.push({{ label: `IFS Members (${{currentStepData.ifs_members.length}})`, color: '#f1948a', dash: false }});
+          currentStepData.ifs_members.forEach(m => drawLines(m, '#e74c3c', 0.9, 0.55));
+          legendItems.push({{ label: `IFS Members (${{currentStepData.ifs_members.length}})`, color: '#e74c3c', dash: false }});
         }}
         if (showAifs && currentStepData.aifs_members) {{
-          currentStepData.aifs_members.forEach(m => drawLines(m, '#82e0aa', 0.6, 0.35));
-          legendItems.push({{ label: `AIFS Members (${{currentStepData.aifs_members.length}})`, color: '#82e0aa', dash: false }});
+          currentStepData.aifs_members.forEach(m => drawLines(m, '#00b894', 0.9, 0.55));
+          legendItems.push({{ label: `AIFS Members (${{currentStepData.aifs_members.length}})`, color: '#00b894', dash: false }});
         }}
       }}
 
-      // 2. Deterministics (Dashed)
+      // 2. Deterministics (Dashed, solid opacity)
       if (showGfs && currentStepData.gfs_det) {{
-        drawLines(currentStepData.gfs_det, '#001155', 1.8, 1.0, true);
+        drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, true);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
       }}
       if (showAigfs && currentStepData.aigfs_det) {{
-        drawLines(currentStepData.aigfs_det, '#8e44ad', 1.8, 1.0, true);
-        legendItems.push({{ label: 'AIGFS Det', color: '#8e44ad', dash: true }});
+        drawLines(currentStepData.aigfs_det, '#4a235a', 2.0, 1.0, true);
+        legendItems.push({{ label: 'AIGFS Det', color: '#4a235a', dash: true }});
       }}
       if (showEcmwf && currentStepData.ecmwf_det) {{
-        drawLines(currentStepData.ecmwf_det, '#990000', 1.8, 1.0, true);
-        legendItems.push({{ label: 'IFS Det', color: '#990000', dash: true }});
+        drawLines(currentStepData.ecmwf_det, '#78281f', 2.0, 1.0, true);
+        legendItems.push({{ label: 'IFS Det', color: '#78281f', dash: true }});
       }}
       if (showAifsDet && currentStepData.aifs_det) {{
-        drawLines(currentStepData.aifs_det, '#009933', 1.8, 1.0, true);
-        legendItems.push({{ label: 'AIFS Det', color: '#009933', dash: true }});
+        drawLines(currentStepData.aifs_det, '#145a32', 2.0, 1.0, true);
+        legendItems.push({{ label: 'AIFS Det', color: '#145a32', dash: true }});
       }}
 
-      // 3. Ensemble Means
+      // 3. Ensemble Means (Thick solid lines)
       if (showGefs && currentStepData.gefs_mean) {{
-        drawLines(currentStepData.gefs_mean, '#0033cc', 2.2, 1.0);
-        legendItems.push({{ label: 'GEFS Mean', color: '#0033cc', dash: false }});
+        drawLines(currentStepData.gefs_mean, '#0044ff', 2.4, 1.0);
+        legendItems.push({{ label: 'GEFS Mean', color: '#0044ff', dash: false }});
       }}
       if (showAigefs && currentStepData.aigefs_mean) {{
-        drawLines(currentStepData.aigefs_mean, '#6c3483', 2.2, 1.0);
-        legendItems.push({{ label: 'AIGEFS Mean', color: '#6c3483', dash: false }});
+        drawLines(currentStepData.aigefs_mean, '#8e44ad', 2.4, 1.0);
+        legendItems.push({{ label: 'AIGEFS Mean', color: '#8e44ad', dash: false }});
       }}
       if (showIfs && currentStepData.ifs_mean) {{
-        drawLines(currentStepData.ifs_mean, '#c0392b', 2.2, 1.0);
-        legendItems.push({{ label: 'IFS Mean', color: '#c0392b', dash: false }});
+        drawLines(currentStepData.ifs_mean, '#d63031', 2.4, 1.0);
+        legendItems.push({{ label: 'IFS Mean', color: '#d63031', dash: false }});
       }}
       if (showAifs && currentStepData.aifs_mean) {{
-        drawLines(currentStepData.aifs_mean, '#196f3d', 2.2, 1.0);
-        legendItems.push({{ label: 'AIFS Mean', color: '#196f3d', dash: false }});
+        drawLines(currentStepData.aifs_mean, '#00b894', 2.4, 1.0);
+        legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // 4. Superensemble Mean
+      // 4. Superensemble Mean (Thick Black + Inline Labels)
       if (showSuper && currentStepData.super_mean) {{
-        drawLines(currentStepData.super_mean, '#000000', 3.0, 1.0);
+        drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
 
         ctx.font = 'bold 11px sans-serif';
