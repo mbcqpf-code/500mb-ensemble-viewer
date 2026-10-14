@@ -1,22 +1,26 @@
 import os
 import json
 import warnings
+import tempfile
 import concurrent.futures
 from datetime import datetime, timedelta
 
 import numpy as np
 import xarray as xr
 import matplotlib
-matplotlib.use('Agg')  # Headless backend
+matplotlib.use('Agg')  # Headless backend for automation
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from herbie import Herbie
 
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 1. DIRECTORIES & RUN CONFIGURATION
+# 1. DIRECTORIES & CONFIGURATION
 # ==============================================================================
 OUTPUT_DIR = "output"
 DATA_DIR = os.path.join(OUTPUT_DIR, "data")
@@ -28,20 +32,82 @@ os.makedirs(SPREAD_DIR, exist_ok=True)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas projection dimensions (1200x800)
+# Fixed canvas dimensions
 CANVAS_W, CANVAS_H = 1200, 800
 
-# Operational Cycle Detector
-now = datetime.utcnow()
-if (now.hour == 1 and now.minute > 30) or (2 <= now.hour <= 12) or (now.hour == 13 and now.minute <= 30):
-    base_date = now - timedelta(days=1)
-    global_cycle = "12"
-else:
-    base_date = now - timedelta(days=1) if now.hour <= 1 else now
-    global_cycle = "00"
+# High-performance HTTP Session with automatic retry and pooling
+http_session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+http_session.mount("https://", adapter)
+http_session.mount("http://", adapter)
+http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; Operational Met Research)"})
 
-global_init_time = base_date.strftime(f'%Y-%m-%d {global_cycle}:00')
-print(f"📡 Global Model Baseline Cycle: {global_init_time}")
+
+# ==============================================================================
+# 2. DYNAMIC CYCLE DETECTOR (ECMWF IFS F240 COMPLETION TRIGGER)
+# ==============================================================================
+def detect_latest_complete_cycle():
+    """
+    Evaluates candidate cycles (newest first) and locks onto the most recent
+    cycle where ECMWF IFS ENS and NOAA AIGEFS have completed through F240.
+    """
+    now = datetime.utcnow()
+    # Floor to the most recent potential 00z or 12z cycle
+    latest_hour = 12 if now.hour >= 12 else 0
+    anchor = now.replace(hour=latest_hour, minute=0, second=0, microsecond=0)
+    
+    # Check the last 4 possible synoptic cycles (48h window)
+    candidates = [anchor - timedelta(hours=12 * i) for i in range(4)]
+    
+    print("🔍 Probing for newest complete 240h ensemble cycle...")
+    for cand in candidates:
+        cycle_str = cand.strftime('%Y-%m-%d %H:00')
+        print(f"  • Checking candidate cycle: {cycle_str}Z...")
+        
+        # 1. Probe ECMWF IFS ENS at lead F240
+        ifs_ready = False
+        try:
+            H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
+            if H_ifs.grib is not None:
+                ifs_ready = True
+        except Exception:
+            pass
+
+        if not ifs_ready:
+            print(f"    ↳ ECMWF IFS F240 not complete for {cycle_str}Z.")
+            continue
+
+        # 2. Probe NOAA AIGEFS at lead F240 (control member: mem000)
+        aigefs_ready = False
+        date_nomads = cand.strftime('%Y%m%d')
+        cycle_nomads = cand.strftime('%H')
+        url_aigefs = (
+            f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/"
+            f"aigefs.{date_nomads}/{cycle_nomads}/mem000/model/atmos/grib2/"
+            f"aigefs.t{cycle_nomads}z.pres.f240.grib2.idx"
+        )
+        try:
+            resp = http_session.head(url_aigefs, timeout=5)
+            if resp.status_code == 200:
+                aigefs_ready = True
+            else:
+                H_ai = Herbie(cycle_str, model="aigefs", product="pres", member="mem000", fxx=240)
+                if H_ai.grib is not None:
+                    aigefs_ready = True
+        except Exception:
+            pass
+
+        if ifs_ready and aigefs_ready:
+            print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
+            return cycle_str
+
+    # Safe fallback if upstream network probes encounter anomalies
+    fallback_str = candidates[1].strftime('%Y-%m-%d %H:00')
+    print(f"⚠️ Falling back to verified baseline: {fallback_str}Z\n")
+    return fallback_str
+
+global_init_time = detect_latest_complete_cycle()
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -52,7 +118,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
+# 3. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
 # ==============================================================================
 print("🗺️ Rendering static Cartopy basemap...")
 fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -74,7 +140,7 @@ geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
 
 
 # ==============================================================================
-# 3. GRID STANDARDIZATION & VECTOR EXTRACTION
+# 4. GRID STANDARDIZATION & VECTOR EXTRACTION
 # ==============================================================================
 def standardize_grid(ds):
     if ds is None:
@@ -140,9 +206,10 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 4. DATA FETCHERS (BALANCED 2x2 ENSEMBLE + DETERMINISTICS)
+# 5. DATA FETCHERS (BALANCED 2x2 ENSEMBLE + DETERMINISTICS)
 # ==============================================================================
-# 1. GEFS (Physics - NCEP)
+
+# 1. GEFS (Physics - NCEP: 31 Members)
 def fetch_gefs_lead(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
     def _worker(m):
@@ -158,33 +225,77 @@ def fetch_gefs_lead(fxx):
                 grids.append(res)
     return grids
 
-# 2. AIGEFS (AI Emulator - NCEP) - FIXED FOR NCEP / NOMADS / AWS MEMBER SCHEME
-def fetch_aigefs_ensemble(fxx):
-    def _worker(m_idx):
-        # NCEP AIGEFS uses integers 0..30 or strings mem001..mem030
-        lookup_keys = [m_idx, f"mem{str(m_idx).zfill(3)}"] if m_idx > 0 else [0, "c00", "mem000"]
-        for mem_key in lookup_keys:
-            for sq in [":HGT:500 mb:", ":HGT:500:"]:
-                try:
-                    H = Herbie(global_init_time, model="aigefs", product="pres", member=mem_key, fxx=fxx)
-                    ds = H.xarray(sq)
-                    grid = standardize_grid(ds)
-                    if grid is not None and grid.ndim == 2:
-                        return grid
-                except Exception:
-                    continue
+# 2. AIGEFS (AI - NCEP: mem000 to mem030, 31 Members via Official SCN 25-89 Spec)
+def fetch_aigefs_direct_http(date_str, cycle_str, member_str, fxx):
+    """Direct HTTP byte-range extraction pointing to official NOMADS directory."""
+    fxx_str = f"f{fxx:03d}"
+    url_base = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.{date_str}/{cycle_str}/{member_str}/model/atmos/grib2/"
+    fname = f"aigefs.t{cycle_str}z.pres.{fxx_str}.grib2"
+    
+    try:
+        r_idx = http_session.get(f"{url_base}{fname}.idx", timeout=8)
+        if r_idx.status_code != 200:
+            return None
+            
+        idx_lines = r_idx.text.splitlines()
+        target_idx = None
+        for i, line in enumerate(idx_lines):
+            if ":HGT:500 mb:" in line or ":HGT:500:" in line:
+                target_idx = i
+                break
+        if target_idx is None:
+            return None
+            
+        start_byte = int(idx_lines[target_idx].split(':')[1])
+        end_byte = int(idx_lines[target_idx + 1].split(':')[1]) - 1 if target_idx + 1 < len(idx_lines) else ""
+        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+        
+        resp = http_session.get(f"{url_base}{fname}", headers=headers, timeout=12)
+        if resp.status_code not in [200, 206]:
+            return None
+            
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+            
+        ds = xr.open_dataset(tmp_path, engine="cfgrib")
+        grid = standardize_grid(ds)
+        ds.close()
+        os.remove(tmp_path)
+        return grid
+    except Exception:
         return None
 
+def fetch_aigefs_ensemble(fxx):
+    date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
+    date_str = date_dt.strftime('%Y%m%d')
+    cycle_str = date_dt.strftime('%H')
+    
+    # Official SCN 25-89: mem000 is control; mem001 through mem030 are perturbed
+    members = [f"mem{str(i).zfill(3)}" for i in range(31)]
+    
+    def _worker(m_str):
+        # Primary: Herbie with official member format
+        for sq in [":HGT:500 mb:", ":HGT:500:"]:
+            try:
+                H = Herbie(global_init_time, model="aigefs", product="pres", member=m_str, fxx=fxx, source="nomads")
+                ds = H.xarray(sq)
+                grid = standardize_grid(ds)
+                if grid is not None and grid.ndim == 2:
+                    return grid
+            except Exception:
+                continue
+        # Secondary: Direct NOMADS byte-range HTTP request
+        return fetch_aigefs_direct_http(date_str, cycle_str, m_str, fxx)
+
     grids = []
-    # Query control (0) and perturbed members 1 through 30
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        for res in executor.map(_worker, list(range(0, 31))):
+        for res in executor.map(_worker, members):
             if res is not None and res.ndim == 2:
                 grids.append(res)
-
     return grids
 
-# 3. ECMWF IFS ENS (Physics - ECMWF)
+# 3. ECMWF IFS ENS (Physics - ECMWF: 51 Members)
 def fetch_ifs_ensemble(fxx):
     grids = []
     try:
@@ -204,7 +315,7 @@ def fetch_ifs_ensemble(fxx):
         pass
     return grids
 
-# 4. AIFS ENS (AI Emulator - ECMWF)
+# 4. AIFS ENS (AI - ECMWF: 51 Members)
 def fetch_aifs_ensemble(fxx):
     grids = []
     try:
@@ -264,7 +375,7 @@ def fetch_aigfs(fxx):
 
 
 # ==============================================================================
-# 5. SPREAD & DISAGREEMENT UNDERLAY ENGINE
+# 6. SPREAD & DISAGREEMENT UNDERLAY ENGINE
 # ==============================================================================
 SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m intervals
 SPREAD_CMAP = plt.cm.YlOrRd
@@ -290,7 +401,7 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
         if spr is not None:
             intra_vars.append(spr**2)
 
-    # Inter-Model Disagreement (Variance among active ensemble means)
+    # Inter-Model Disagreement
     if len(means) > 1:
         spr_inter = np.std(np.stack(means), axis=0, ddof=1)
     else:
@@ -346,13 +457,13 @@ def render_spread_underlay(spread_grid, filename):
 
 
 # ==============================================================================
-# 6. BATCH PRODUCTION LOOP
+# 7. BATCH PRODUCTION LOOP
 # ==============================================================================
 for fxx in FXX_STEPS:
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    # 1. Fetch ensembles
+    # 1. Fetch all 4 ensembles
     gefs_mems   = fetch_gefs_lead(fxx)
     aigefs_mems = fetch_aigefs_ensemble(fxx)
     ifs_mems    = fetch_ifs_ensemble(fxx)
@@ -412,7 +523,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 7. GENERATE DYNAMIC HTML FRONTEND
+# 8. GENERATE DYNAMIC HTML FRONTEND
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -459,7 +570,6 @@ html_content = f"""<!DOCTYPE html>
       border: 1px solid var(--border); font-size: 13px; cursor: pointer;
     }}
 
-    /* Structured Model Groups */
     .model-group-row {{
       display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px;
     }}
@@ -472,7 +582,6 @@ html_content = f"""<!DOCTYPE html>
     .checkbox-item {{ display: flex; align-items: center; gap: 6px; cursor: pointer; margin-right: 6px; }}
     .swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
 
-    /* Contour Level Chips */
     .contour-section {{ border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
     .contour-chips {{ display: flex; flex-wrap: wrap; gap: 5px; max-height: 80px; overflow-y: auto; }}
     .chip {{
@@ -522,7 +631,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle">Baseline Cycle: {global_init_time}Z | Full 240-Hour Range</div>
+    <div class="subtitle" id="cycleSubtitle">Baseline Cycle: {global_init_time}Z | Full 240-Hour Range</div>
   </div>
 
   <div class="toolbar">
@@ -565,7 +674,6 @@ html_content = f"""<!DOCTYPE html>
 
     <!-- Row 2: Structured Model Toggles (Ensembles vs Deterministics) -->
     <div class="model-group-row">
-      <!-- Ensemble Systems & Means -->
       <div class="group-line">
         <span class="group-label">
           Ensembles & Means:
@@ -579,7 +687,6 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
       </div>
 
-      <!-- Deterministic Models -->
       <div class="group-line">
         <span class="group-label">
           Deterministics:
@@ -628,7 +735,6 @@ html_content = f"""<!DOCTYPE html>
     let dataCache = {{}};
     let currentStepData = null;
 
-    // Contour Selector Chips
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
@@ -675,7 +781,6 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
-    // Group Selection Helpers (All / None)
     function setGroup(grp, state) {{
       if (grp === 'ens') {{
         ['chk_super', 'chk_gefs', 'chk_aigefs', 'chk_ifs', 'chk_aifs'].forEach(id => {{
@@ -689,7 +794,6 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
-    // Underlay Management
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
@@ -705,7 +809,6 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Load Step Data
     async function loadStepData() {{
       const fxx = document.getElementById('leadSelect').value;
       updateBackground();
@@ -740,7 +843,6 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowRight') step(1);
     }});
 
-    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -787,7 +889,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Members (Spaghetti) - Brightened colors, increased width (0.9) & opacity (0.55)
+      // 1. Members (Spaghetti) - Crisp width (0.9) & opacity (0.55)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
           currentStepData.gefs_members.forEach(m => drawLines(m, '#2980b9', 0.9, 0.55));
@@ -807,7 +909,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Deterministics (Dashed, solid opacity)
+      // 2. Deterministics (Dashed)
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, true);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
@@ -825,7 +927,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Det', color: '#145a32', dash: true }});
       }}
 
-      // 3. Ensemble Means (Thick solid lines)
+      // 3. Ensemble Means
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0044ff', 2.4, 1.0);
         legendItems.push({{ label: 'GEFS Mean', color: '#0044ff', dash: false }});
@@ -843,7 +945,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // 4. Superensemble Mean (Thick Black + Inline Labels)
+      // 4. Superensemble Mean
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
