@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import warnings
 import tempfile
 import concurrent.futures
@@ -8,8 +9,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import xarray as xr
 import matplotlib
-matplotlib.use('Agg')  # Headless backend for automation
+matplotlib.use('Agg')  # Headless backend
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import requests
@@ -20,22 +22,20 @@ from herbie import Herbie
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 1. DIRECTORIES & CONFIGURATION
+# 1. DIRECTORIES & RUN CONFIGURATION
 # ==============================================================================
 OUTPUT_DIR = "output"
-DATA_DIR = os.path.join(OUTPUT_DIR, "data")
-SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(SPREAD_DIR, exist_ok=True)
+RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
+os.makedirs(RUNS_DIR, exist_ok=True)
 
 # 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas dimensions
+# Fixed canvas dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
-# High-performance HTTP Session with automatic retry and pooling
+# High-performance HTTP Session with connection pooling and retries
 http_session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -48,24 +48,19 @@ http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; 
 # 2. DYNAMIC CYCLE DETECTOR (ECMWF IFS F240 COMPLETION TRIGGER)
 # ==============================================================================
 def detect_latest_complete_cycle():
-    """
-    Evaluates candidate cycles (newest first) and locks onto the most recent
-    cycle where ECMWF IFS ENS and NOAA AIGEFS have completed through F240.
-    """
+    """Probes candidate synoptic cycles and locks onto the latest completed F240 run."""
     now = datetime.utcnow()
-    # Floor to the most recent potential 00z or 12z cycle
     latest_hour = 12 if now.hour >= 12 else 0
     anchor = now.replace(hour=latest_hour, minute=0, second=0, microsecond=0)
     
-    # Check the last 4 possible synoptic cycles (48h window)
     candidates = [anchor - timedelta(hours=12 * i) for i in range(4)]
-    
     print("🔍 Probing for newest complete 240h ensemble cycle...")
+    
     for cand in candidates:
         cycle_str = cand.strftime('%Y-%m-%d %H:00')
         print(f"  • Checking candidate cycle: {cycle_str}Z...")
         
-        # 1. Probe ECMWF IFS ENS at lead F240
+        # Probe ECMWF IFS ENS at F240
         ifs_ready = False
         try:
             H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
@@ -78,7 +73,7 @@ def detect_latest_complete_cycle():
             print(f"    ↳ ECMWF IFS F240 not complete for {cycle_str}Z.")
             continue
 
-        # 2. Probe NOAA AIGEFS at lead F240 (control member: mem000)
+        # Probe NOAA AIGEFS at F240 (control member: mem000)
         aigefs_ready = False
         date_nomads = cand.strftime('%Y%m%d')
         cycle_nomads = cand.strftime('%H')
@@ -102,12 +97,20 @@ def detect_latest_complete_cycle():
             print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
             return cycle_str
 
-    # Safe fallback if upstream network probes encounter anomalies
     fallback_str = candidates[1].strftime('%Y-%m-%d %H:00')
     print(f"⚠️ Falling back to verified baseline: {fallback_str}Z\n")
     return fallback_str
 
 global_init_time = detect_latest_complete_cycle()
+date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
+current_cycle_id = date_dt.strftime('%Y%m%d_%H')
+
+# Define target directories for the active cycle
+CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
+CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
+CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
+os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
+os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -120,22 +123,22 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 # ==============================================================================
 # 3. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
 # ==============================================================================
-print("🗺️ Rendering static Cartopy basemap...")
+basemap_path = os.path.join(OUTPUT_DIR, "basemap.png")
 fig = plt.figure(figsize=(12, 8), dpi=100)
 ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
 ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-ax.add_feature(cfeature.LAND, facecolor="#f8f9fa")
-ax.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
-ax.add_feature(cfeature.COASTLINE, linewidth=1.1, edgecolor="#333333")
-ax.add_feature(cfeature.BORDERS, linewidth=1.0, edgecolor="#333333")
-ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#888888", linestyle=":")
-ax.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#888888", linewidth=0.4)
+if not os.path.exists(basemap_path):
+    print("🗺️ Rendering static Cartopy basemap...")
+    ax.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.1, edgecolor="#333333")
+    ax.add_feature(cfeature.BORDERS, linewidth=1.0, edgecolor="#333333")
+    ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#888888", linestyle=":")
+    ax.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#888888", linewidth=0.4)
+    fig.savefig(basemap_path, dpi=100)
+    print("✅ Saved basemap.png")
 
-fig.savefig(os.path.join(OUTPUT_DIR, "basemap.png"), dpi=100)
-print("✅ Saved basemap.png")
-
-# Transform mapping PlateCarree (lon, lat) -> Screen Pixel Coordinates
 geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
 
 
@@ -165,7 +168,6 @@ def standardize_grid(ds):
         return None
 
 def extract_contours(grid):
-    """Computes contours and converts them to pixel coordinates."""
     if grid is None or np.all(np.isnan(grid)):
         return {}
     try:
@@ -206,10 +208,8 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 5. DATA FETCHERS (BALANCED 2x2 ENSEMBLE + DETERMINISTICS)
+# 5. DATA FETCHERS (BALANCED 2x2 ENSEMBLES + DETERMINISTICS)
 # ==============================================================================
-
-# 1. GEFS (Physics - NCEP: 31 Members)
 def fetch_gefs_lead(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
     def _worker(m):
@@ -225,18 +225,14 @@ def fetch_gefs_lead(fxx):
                 grids.append(res)
     return grids
 
-# 2. AIGEFS (AI - NCEP: mem000 to mem030, 31 Members via Official SCN 25-89 Spec)
 def fetch_aigefs_direct_http(date_str, cycle_str, member_str, fxx):
-    """Direct HTTP byte-range extraction pointing to official NOMADS directory."""
     fxx_str = f"f{fxx:03d}"
     url_base = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.{date_str}/{cycle_str}/{member_str}/model/atmos/grib2/"
     fname = f"aigefs.t{cycle_str}z.pres.{fxx_str}.grib2"
-    
     try:
         r_idx = http_session.get(f"{url_base}{fname}.idx", timeout=8)
         if r_idx.status_code != 200:
             return None
-            
         idx_lines = r_idx.text.splitlines()
         target_idx = None
         for i, line in enumerate(idx_lines):
@@ -245,19 +241,15 @@ def fetch_aigefs_direct_http(date_str, cycle_str, member_str, fxx):
                 break
         if target_idx is None:
             return None
-            
         start_byte = int(idx_lines[target_idx].split(':')[1])
         end_byte = int(idx_lines[target_idx + 1].split(':')[1]) - 1 if target_idx + 1 < len(idx_lines) else ""
         headers = {"Range": f"bytes={start_byte}-{end_byte}"}
-        
         resp = http_session.get(f"{url_base}{fname}", headers=headers, timeout=12)
         if resp.status_code not in [200, 206]:
             return None
-            
         with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
             tmp.write(resp.content)
             tmp_path = tmp.name
-            
         ds = xr.open_dataset(tmp_path, engine="cfgrib")
         grid = standardize_grid(ds)
         ds.close()
@@ -267,15 +259,10 @@ def fetch_aigefs_direct_http(date_str, cycle_str, member_str, fxx):
         return None
 
 def fetch_aigefs_ensemble(fxx):
-    date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
     date_str = date_dt.strftime('%Y%m%d')
     cycle_str = date_dt.strftime('%H')
-    
-    # Official SCN 25-89: mem000 is control; mem001 through mem030 are perturbed
     members = [f"mem{str(i).zfill(3)}" for i in range(31)]
-    
     def _worker(m_str):
-        # Primary: Herbie with official member format
         for sq in [":HGT:500 mb:", ":HGT:500:"]:
             try:
                 H = Herbie(global_init_time, model="aigefs", product="pres", member=m_str, fxx=fxx, source="nomads")
@@ -285,7 +272,6 @@ def fetch_aigefs_ensemble(fxx):
                     return grid
             except Exception:
                 continue
-        # Secondary: Direct NOMADS byte-range HTTP request
         return fetch_aigefs_direct_http(date_str, cycle_str, m_str, fxx)
 
     grids = []
@@ -295,7 +281,6 @@ def fetch_aigefs_ensemble(fxx):
                 grids.append(res)
     return grids
 
-# 3. ECMWF IFS ENS (Physics - ECMWF: 51 Members)
 def fetch_ifs_ensemble(fxx):
     grids = []
     try:
@@ -315,7 +300,6 @@ def fetch_ifs_ensemble(fxx):
         pass
     return grids
 
-# 4. AIFS ENS (AI - ECMWF: 51 Members)
 def fetch_aifs_ensemble(fxx):
     grids = []
     try:
@@ -345,7 +329,6 @@ def fetch_aifs_ensemble(fxx):
         pass
     return grids
 
-# Deterministic Fetchers
 def fetch_deterministic(model_name, product, search_str, fxx):
     try:
         H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
@@ -375,13 +358,16 @@ def fetch_aigfs(fxx):
 
 
 # ==============================================================================
-# 6. SPREAD & DISAGREEMENT UNDERLAY ENGINE
+# 6. SPREAD & UNDERLAY RENDER ENGINE (SEQUENTIAL & DIVERGING)
 # ==============================================================================
 SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m intervals
 SPREAD_CMAP = plt.cm.YlOrRd
 
+DIFF_LEVELS = np.arange(-80, 85, 10)  # -80m to +80m difference intervals
+DIFF_CMAP = plt.cm.RdBu_r
+DIFF_NORM = mcolors.TwoSlopeNorm(vmin=-80, vcenter=0, vmax=80)
+
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
-    """Calculates internal intra-spreads, pooled intra-spread, and inter-model disagreement."""
     def calc_spread(mem_list):
         if len(mem_list) > 1:
             return np.std(np.stack(mem_list), axis=0, ddof=1)
@@ -430,8 +416,7 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
         "aifs": spr_aifs
     }
 
-def render_spread_underlay(spread_grid, filename):
-    """Renders shaded background contours matching basemap dimensions."""
+def render_spread_underlay(spread_grid, filename, target_dir):
     if spread_grid is None or np.all(np.isnan(spread_grid)):
         return
     fig_spr = plt.figure(figsize=(12, 8), dpi=100)
@@ -452,18 +437,42 @@ def render_spread_underlay(spread_grid, filename):
     ax_spr.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
     ax_spr.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
 
-    fig_spr.savefig(os.path.join(SPREAD_DIR, filename), dpi=100)
+    fig_spr.savefig(os.path.join(target_dir, filename), dpi=100)
     plt.close(fig_spr)
 
+def render_diff_underlay(diff_grid, filename, target_dir):
+    if diff_grid is None or np.all(np.isnan(diff_grid)):
+        return
+    fig_d = plt.figure(figsize=(12, 8), dpi=100)
+    ax_d = fig_d.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
+    ax_d.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    ax_d.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax_d.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
+
+    ax_d.contourf(
+        target_lons, target_lats, diff_grid,
+        levels=DIFF_LEVELS, cmap=DIFF_CMAP, norm=DIFF_NORM,
+        transform=ccrs.PlateCarree(), extend='both', alpha=0.85
+    )
+
+    ax_d.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
+    ax_d.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
+    ax_d.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
+    ax_d.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
+
+    fig_d.savefig(os.path.join(target_dir, filename), dpi=100)
+    plt.close(fig_d)
+
 
 # ==============================================================================
-# 7. BATCH PRODUCTION LOOP
+# 7. BATCH PRODUCTION LOOP (CURRENT CYCLE)
 # ==============================================================================
 for fxx in FXX_STEPS:
-    valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
+    valid_time = date_dt + timedelta(hours=fxx)
     print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    # 1. Fetch all 4 ensembles
+    # 1. Fetch ensembles
     gefs_mems   = fetch_gefs_lead(fxx)
     aigefs_mems = fetch_aigefs_ensemble(fxx)
     ifs_mems    = fetch_ifs_ensemble(fxx)
@@ -480,19 +489,26 @@ for fxx in FXX_STEPS:
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # 3. Compute and render Spread Underlays
+    # 3. Physics vs AI Difference Calculation
+    phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
+    ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
+    if phys_cluster and ai_cluster:
+        physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0)
+        render_diff_underlay(physics_vs_ai_diff, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+
+    # 4. Compute and render Spread Underlays
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
-            render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png")
+            render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
 
-    # 4. Fetch deterministics
+    # 5. Fetch deterministics
     det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
     det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
     det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
     det_aigfs = fetch_aigfs(fxx)
 
-    # 5. Extract vector contours
+    # 6. Extract vector contours
     super_contours = extract_contours(super_mean)
     print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
@@ -515,7 +531,7 @@ for fxx in FXX_STEPS:
         "aifs_members": [extract_contours(m) for m in aifs_mems]
     }
 
-    json_path = os.path.join(DATA_DIR, f"f{fxx:03d}.json")
+    json_path = os.path.join(CURRENT_DATA_DIR, f"f{fxx:03d}.json")
     with open(json_path, "w") as f:
         json.dump(step_data, f, separators=(',', ':'))
 
@@ -523,7 +539,46 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. GENERATE DYNAMIC HTML FRONTEND
+# 8. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 10 RUNS)
+# ==============================================================================
+print("\n🗄️ Managing 10-Run Archive...")
+all_cycles = sorted(
+    [d for d in os.listdir(RUNS_DIR) if os.path.isdir(os.path.join(RUNS_DIR, d))],
+    reverse=True
+)
+
+# Prune cycles older than 10
+if len(all_cycles) > 10:
+    for old_cycle in all_cycles[10:]:
+        old_path = os.path.join(RUNS_DIR, old_cycle)
+        print(f"  🗑️ Pruning archive cycle older than 10 runs: {old_cycle}")
+        shutil.rmtree(old_path, ignore_errors=True)
+all_cycles = all_cycles[:10]
+
+# Build manifest.json
+manifest = {
+    "latest": all_cycles[0],
+    "runs": []
+}
+for c_id in all_cycles:
+    try:
+        dt = datetime.strptime(c_id, "%Y%m%d_%H")
+        manifest["runs"].append({
+            "id": c_id,
+            "label": dt.strftime("%Y-%m-%d %Hz"),
+            "init": dt.strftime("%Y-%m-%d %H:00")
+        })
+    except Exception:
+        pass
+
+manifest_path = os.path.join(OUTPUT_DIR, "manifest.json")
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycles.")
+
+
+# ==============================================================================
+# 9. GENERATE DYNAMIC HTML FRONTEND (WITH CYCLE SCRUBBING & DPROG/DT)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -545,20 +600,20 @@ html_content = f"""<!DOCTYPE html>
       margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center;
     }}
     .header {{
-      width: 100%; max-width: 1250px; padding: 16px 20px 8px 20px; box-sizing: border-box; text-align: center;
+      width: 100%; max-width: 1250px; padding: 14px 20px 6px 20px; box-sizing: border-box; text-align: center;
     }}
-    .header h2 {{ margin: 0 0 6px 0; font-size: 1.4rem; }}
-    .header .subtitle {{ font-size: 0.9rem; color: var(--text-muted); }}
+    .header h2 {{ margin: 0 0 4px 0; font-size: 1.35rem; }}
+    .header .subtitle {{ font-size: 0.85rem; color: var(--text-muted); }}
 
     .toolbar {{
       width: 100%; max-width: 1250px; background: var(--card-bg); border: 1px solid var(--border);
-      border-radius: 10px; padding: 12px 16px; margin: 10px 0; box-sizing: border-box;
-      display: flex; flex-direction: column; gap: 12px;
+      border-radius: 10px; padding: 10px 16px; margin: 8px 0; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 10px;
     }}
-    .row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 12px; justify-content: space-between; }}
+    .row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 10px; justify-content: space-between; }}
     .btn {{
-      background: var(--accent); color: white; border: none; padding: 6px 14px; border-radius: 6px;
-      cursor: pointer; font-size: 13px; font-weight: 600; transition: 0.15s;
+      background: var(--accent); color: white; border: none; padding: 5px 12px; border-radius: 6px;
+      cursor: pointer; font-size: 12px; font-weight: 600; transition: 0.15s;
     }}
     .btn:hover {{ filter: brightness(1.15); }}
     .btn-secondary {{ background: #475569; }}
@@ -566,27 +621,27 @@ html_content = f"""<!DOCTYPE html>
     .btn-micro:hover {{ background: #475569; }}
     
     select {{
-      padding: 6px 10px; border-radius: 6px; background: #0f172a; color: white;
-      border: 1px solid var(--border); font-size: 13px; cursor: pointer;
+      padding: 5px 8px; border-radius: 6px; background: #0f172a; color: white;
+      border: 1px solid var(--border); font-size: 12px; cursor: pointer;
     }}
 
     .model-group-row {{
-      display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px;
+      display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px;
     }}
     .group-line {{
-      display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px;
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px;
     }}
     .group-label {{
       font-weight: bold; min-width: 130px; display: flex; align-items: center; gap: 6px;
     }}
-    .checkbox-item {{ display: flex; align-items: center; gap: 6px; cursor: pointer; margin-right: 6px; }}
+    .checkbox-item {{ display: flex; align-items: center; gap: 5px; cursor: pointer; margin-right: 6px; }}
     .swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
 
-    .contour-section {{ border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
-    .contour-chips {{ display: flex; flex-wrap: wrap; gap: 5px; max-height: 80px; overflow-y: auto; }}
+    .contour-section {{ border-top: 1px solid var(--border); padding-top: 6px; display: flex; flex-direction: column; gap: 6px; }}
+    .contour-chips {{ display: flex; flex-wrap: wrap; gap: 4px; max-height: 70px; overflow-y: auto; }}
     .chip {{
       background: #0f172a; border: 1px solid var(--border); color: #cbd5e1;
-      padding: 3px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; user-select: none;
+      padding: 2px 7px; border-radius: 4px; font-size: 11px; cursor: pointer; user-select: none;
     }}
     .chip.active {{ background: #2563eb; color: white; border-color: #3b82f6; font-weight: bold; }}
 
@@ -601,12 +656,12 @@ html_content = f"""<!DOCTYPE html>
     
     .legend-box {{
       position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
-      color: #111; padding: 8px 12px; border-radius: 6px; font-size: 12px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 4px;
+      color: #111; padding: 6px 10px; border-radius: 6px; font-size: 11px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3px;
       pointer-events: none; max-width: 250px;
     }}
-    .legend-line {{ display: flex; align-items: center; gap: 8px; }}
-    .line-sample {{ width: 22px; height: 3px; display: inline-block; }}
+    .legend-line {{ display: flex; align-items: center; gap: 7px; }}
+    .line-sample {{ width: 20px; height: 3px; display: inline-block; }}
 
     .title-stamp {{
       position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.94);
@@ -615,15 +670,13 @@ html_content = f"""<!DOCTYPE html>
     }}
     
     .spread-colorbar {{
-      display: none; align-items: center; gap: 8px; font-size: 11px;
+      display: none; align-items: center; gap: 6px; font-size: 11px;
     }}
     .colorbar-gradient {{
-      width: 130px; height: 12px; border-radius: 3px;
-      background: linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026);
-      border: 1px solid var(--border);
+      width: 120px; height: 11px; border-radius: 3px; border: 1px solid var(--border);
     }}
 
-    .footer {{ margin: 15px 0 30px 0; font-size: 12px; color: var(--text-muted); }}
+    .footer {{ margin: 12px 0 25px 0; font-size: 12px; color: var(--text-muted); }}
     kbd {{ background: #334155; padding: 2px 5px; border-radius: 4px; font-size: 11px; }}
   </style>
 </head>
@@ -631,30 +684,30 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle" id="cycleSubtitle">Baseline Cycle: {global_init_time}Z | Full 240-Hour Range</div>
+    <div class="subtitle" id="cycleSubtitle">Multi-Cycle Operational Trend Analysis (10-Run Archive)</div>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Forecast Lead, Display Mode, and Underlay Shading -->
+    <!-- Row 1: Model Cycle Selection & dprog/dt sync -->
     <div class="row">
-      <div style="display: flex; gap: 8px; align-items: center;">
-        <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
-        <select id="leadSelect" onchange="loadStepData()">
-          {"".join([f'<option value="{f:03d}">F{f:03d} (+{f}h)</option>' for f in FXX_STEPS])}
-        </select>
-        <button class="btn btn-secondary" onclick="step(1)">Next ▶</button>
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <b>Model Run:</b>
+        <button class="btn btn-secondary" onclick="stepRun(1)" title="Step to older run (Arrow Up)">▲ Older</button>
+        <select id="runSelect" onchange="onRunChanged()"></select>
+        <button class="btn btn-secondary" onclick="stepRun(-1)" title="Step to newer run (Arrow Down)">▼ Newer</button>
       </div>
 
-      <div style="display: flex; gap: 14px; align-items: center;">
-        <b>Display Mode:</b>
-        <label><input type="radio" name="displayMode" value="spaghetti" checked onchange="draw()"> Spaghetti + Means</label>
-        <label><input type="radio" name="displayMode" value="means" onchange="draw()"> Means Only</label>
+      <div style="display: flex; gap: 10px; align-items: center; font-size: 12px;">
+        <label title="When changing model runs, automatically shifts lead time to track the exact same valid time.">
+          <input type="checkbox" id="chk_dprogdt" checked> <b>Sync Valid Time (dprog/dt)</b>
+        </label>
       </div>
 
       <div style="display: flex; gap: 8px; align-items: center;">
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
           <option value="none">Basemap Only</option>
+          <option value="physics_vs_ai">Physics minus AI (Phys - AI)</option>
           <option value="inter">Inter-Model Disagreement (σ_inter)</option>
           <option value="total">Total Super Spread (σ_total)</option>
           <option value="intra_pooled">Pooled Internal Chaos (σ_intra)</option>
@@ -665,14 +718,32 @@ html_content = f"""<!DOCTYPE html>
         </select>
 
         <div class="spread-colorbar" id="cbarBox">
-          <span>10m</span>
-          <div class="colorbar-gradient"></div>
-          <span>120m+</span>
+          <span id="cbarMin">10m</span>
+          <div class="colorbar-gradient" id="cbarGrad"></div>
+          <span id="cbarMax">120m+</span>
         </div>
       </div>
     </div>
 
-    <!-- Row 2: Structured Model Toggles (Ensembles vs Deterministics) -->
+    <!-- Row 2: Lead Scrubbing & Display Mode -->
+    <div class="row">
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <b>Forecast Lead:</b>
+        <button class="btn btn-secondary" onclick="stepLead(-1)">◀ Prev</button>
+        <select id="leadSelect" onchange="loadStepData()">
+          {"".join([f'<option value="{f:03d}">F{f:03d} (+{f}h)</option>' for f in FXX_STEPS])}
+        </select>
+        <button class="btn btn-secondary" onclick="stepLead(1)">Next ▶</button>
+      </div>
+
+      <div style="display: flex; gap: 12px; align-items: center; font-size: 12px;">
+        <b>Display Mode:</b>
+        <label><input type="radio" name="displayMode" value="spaghetti" checked onchange="draw()"> Spaghetti + Means</label>
+        <label><input type="radio" name="displayMode" value="means" onchange="draw()"> Means Only</label>
+      </div>
+    </div>
+
+    <!-- Row 3: Structured Model Toggles (Ensembles vs Deterministics) -->
     <div class="model-group-row">
       <div class="group-line">
         <span class="group-label">
@@ -700,13 +771,13 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 3: Height Contours (4980 to 6000m) -->
+    <!-- Row 4: Height Contours (4980 to 6000m) -->
     <div class="contour-section">
-      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-        <span style="font-size: 13px; font-weight: bold;">Contour Levels (m):</span>
-        <button class="btn btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="selectAllContours(true)">Select All</button>
-        <button class="btn btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="setStandardContours()">Standard 500mb (5400-5880)</button>
-        <button class="btn btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="selectAllContours(false)">Clear All</button>
+      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+        <span style="font-size: 12px; font-weight: bold;">Contour Levels (m):</span>
+        <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="selectAllContours(true)">Select All</button>
+        <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="setStandardContours()">Standard 500mb (5400-5880)</button>
+        <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="selectAllContours(false)">Clear All</button>
       </div>
       <div class="contour-chips" id="contourChips"></div>
     </div>
@@ -725,16 +796,26 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> arrow keys to scrub forecast lead times.
+    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> for Forecast Leads | Use <kbd>↑</kbd> and <kbd>↓</kbd> for Model Cycles (Older/Newer).
   </div>
 
   <script>
     const ALL_CONTOURS = {ALL_CONTOURS};
     const STANDARD_CONTOURS = [5400, 5520, 5640, 5760, 5880];
+    const FXX_STEPS = {FXX_STEPS};
     let selectedContours = new Set(ALL_CONTOURS);
     let dataCache = {{}};
     let currentStepData = null;
+    let manifestData = {{ runs: [] }};
 
+    function parseUtcDate(str) {{
+      const [d, t] = str.split(' ');
+      const [yr, mo, da] = d.split('-').map(Number);
+      const [hr, mi] = t.split(':').map(Number);
+      return new Date(Date.UTC(yr, mo - 1, da, hr, mi));
+    }}
+
+    // Contour Selector Chips
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
@@ -794,34 +875,51 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
+    // Underlay & Colorbar Styling
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
+      const runId = document.getElementById('runSelect').value;
       const img = document.getElementById('mapUnderlay');
       const cbar = document.getElementById('cbarBox');
+      const cbarGrad = document.getElementById('cbarGrad');
+      const cbarMin = document.getElementById('cbarMin');
+      const cbarMax = document.getElementById('cbarMax');
 
       if (bg === 'none') {{
         img.src = 'basemap.png';
         cbar.style.display = 'none';
-      }} else {{
-        img.src = `spread/${{bg}}_f${{fxx}}.png`;
+      }} else if (bg === 'physics_vs_ai') {{
+        img.src = `runs/${{runId}}/spread/physics_vs_ai_f${{fxx}}.png`;
         cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #2166ac, #67a9cf, #d1e5f0, #f7f7f7, #fddbc7, #ef8a62, #b2182b)';
+        cbarMin.textContent = '-80m (AI)';
+        cbarMax.textContent = '+80m (Phys)';
+      }} else {{
+        img.src = `runs/${{runId}}/spread/${{bg}}_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026)';
+        cbarMin.textContent = '10m';
+        cbarMax.textContent = '120m+';
       }}
     }}
 
+    // Load Data
     async function loadStepData() {{
+      const runId = document.getElementById('runSelect').value;
       const fxx = document.getElementById('leadSelect').value;
+      const cacheKey = `${{runId}}_${{fxx}}`;
       updateBackground();
 
-      if (dataCache[fxx]) {{
-        currentStepData = dataCache[fxx];
+      if (dataCache[cacheKey]) {{
+        currentStepData = dataCache[cacheKey];
         draw();
         return;
       }}
       try {{
-        const resp = await fetch(`data/f${{fxx}}.json`);
+        const resp = await fetch(`runs/${{runId}}/data/f${{fxx}}.json`);
         const json = await resp.json();
-        dataCache[fxx] = json;
+        dataCache[cacheKey] = json;
         currentStepData = json;
         draw();
       }} catch (err) {{
@@ -829,7 +927,8 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    function step(delta) {{
+    // Navigation & dprog/dt Sync
+    function stepLead(delta) {{
       const select = document.getElementById('leadSelect');
       let idx = select.selectedIndex + delta;
       if (idx >= 0 && idx < select.options.length) {{
@@ -838,11 +937,40 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
+    function stepRun(delta) {{
+      const select = document.getElementById('runSelect');
+      let idx = select.selectedIndex + delta;
+      if (idx >= 0 && idx < select.options.length) {{
+        select.selectedIndex = idx;
+        onRunChanged();
+      }}
+    }}
+
+    function onRunChanged() {{
+      const syncDprog = document.getElementById('chk_dprogdt').checked;
+      if (syncDprog && currentStepData) {{
+        const currentValid = parseUtcDate(currentStepData.valid);
+        const selectedRunObj = manifestData.runs.find(r => r.id === document.getElementById('runSelect').value);
+        if (selectedRunObj) {{
+          const newInit = parseUtcDate(selectedRunObj.init);
+          const targetFxx = Math.round((currentValid - newInit) / 3600000);
+          
+          if (FXX_STEPS.includes(targetFxx)) {{
+            document.getElementById('leadSelect').value = String(targetFxx).padStart(3, '0');
+          }}
+        }}
+      }}
+      loadStepData();
+    }}
+
     document.addEventListener('keydown', (e) => {{
-      if (e.key === 'ArrowLeft') step(-1);
-      if (e.key === 'ArrowRight') step(1);
+      if (e.key === 'ArrowLeft') {{ e.preventDefault(); stepLead(-1); }}
+      if (e.key === 'ArrowRight') {{ e.preventDefault(); stepLead(1); }}
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(1); }}    // Older cycle
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(-1); }} // Newer cycle
     }});
 
+    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -889,7 +1017,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Members (Spaghetti) - Crisp width (0.9) & opacity (0.55)
+      // 1. Members (Spaghetti)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
           currentStepData.gefs_members.forEach(m => drawLines(m, '#2980b9', 0.9, 0.55));
@@ -966,7 +1094,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
@@ -976,7 +1103,23 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
-    loadStepData();
+    // Initial Load & Populate Runs Dropdown from manifest.json
+    async function initViewer() {{
+      try {{
+        const resp = await fetch('manifest.json');
+        manifestData = await resp.json();
+        const runSelect = document.getElementById('runSelect');
+        runSelect.innerHTML = manifestData.runs.map((r, i) => 
+          `<option value="${{r.id}}">${{r.label}}${{i === 0 ? ' (Latest)' : ''}}</option>`
+        ).join('');
+        runSelect.value = manifestData.latest;
+      }} catch (e) {{
+        console.warn("Could not load manifest.json, using fallback.");
+      }}
+      loadStepData();
+    }}
+
+    initViewer();
   </script>
 </body>
 </html>
