@@ -6,7 +6,7 @@ on:
     - cron: '30 6 * * *'
     # 18:30 UTC captures the 12Z global packages
     - cron: '30 18 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI anytime
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 permissions:
   contents: write
@@ -28,7 +28,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install System GIS Dependencies
         run: |
@@ -38,7 +37,15 @@ jobs:
       - name: Install Python Dependencies
         run: |
           pip install --upgrade pip
-          pip install herbie-data cartopy cfgrib eccodes xarray scipy matplotlib
+          pip install herbie-data cartopy cfgrib eccodes xarray scipy matplotlib requests
+
+      - name: Restore Previous Runs Archive Cache
+        uses: actions/cache@v4
+        with:
+          path: output/runs
+          key: viewer-archive-${{ github.run_id }}
+          restore-keys: |
+            viewer-archive-
 
       - name: Run 500mb Height Generator
         run: |
