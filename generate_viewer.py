@@ -547,7 +547,6 @@ all_cycles = sorted(
     reverse=True
 )
 
-# Prune cycles older than 10
 if len(all_cycles) > 10:
     for old_cycle in all_cycles[10:]:
         old_path = os.path.join(RUNS_DIR, old_cycle)
@@ -555,7 +554,6 @@ if len(all_cycles) > 10:
         shutil.rmtree(old_path, ignore_errors=True)
 all_cycles = all_cycles[:10]
 
-# Build manifest.json
 manifest = {
     "latest": all_cycles[0],
     "runs": []
@@ -578,7 +576,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (WITH CYCLE SCRUBBING & DPROG/DT)
+# 9. GENERATE DYNAMIC HTML FRONTEND (FIXED DPROG/DT VALID TIME SYNC)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -684,11 +682,11 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle" id="cycleSubtitle">Multi-Cycle Operational Trend Analysis (10-Run Archive)</div>
+    <div class="subtitle">Multi-Cycle Operational Trend Analysis (10-Run Archive)</div>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Model Cycle Selection & dprog/dt sync -->
+    <!-- Row 1: Model Cycle Selection & dprog/dt Sync -->
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <b>Model Run:</b>
@@ -697,10 +695,12 @@ html_content = f"""<!DOCTYPE html>
         <button class="btn btn-secondary" onclick="stepRun(1)" title="Step to older run (Arrow Down)">▼ Older</button>
       </div>
 
-      <div style="display: flex; gap: 10px; align-items: center; font-size: 12px;">
-        <label title="When changing model runs, automatically shifts lead time to track the exact same valid time.">
-          <input type="checkbox" id="chk_dprogdt" checked> <b>Sync Valid Time (dprog/dt)</b>
+      <div style="display: flex; gap: 8px; align-items: center; font-size: 12px; background: #0f172a; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);">
+        <label style="cursor: pointer; display: flex; align-items: center; gap: 6px;" title="When changing model runs, automatically shifts lead time to track the exact same valid time.">
+          <input type="checkbox" id="chk_dprogdt" checked onchange="updateDprogBadge()"> 
+          <span style="color: #60a5fa; font-weight: bold;">dprog/dt Mode:</span> Sync Valid Time
         </label>
+        <span id="dprogStatus" style="color: #cbd5e1; font-size: 11px; margin-left: 4px;"></span>
       </div>
 
       <div style="display: flex; gap: 8px; align-items: center;">
@@ -808,11 +808,25 @@ html_content = f"""<!DOCTYPE html>
     let currentStepData = null;
     let manifestData = {{ runs: [] }};
 
+    // Robust UTC Date & Run ID Parsers
     function parseUtcDate(str) {{
-      const [d, t] = str.split(' ');
+      if (!str) return NaN;
+      const clean = str.replace(/[Zz]/g, '').trim();
+      const parts = clean.split(' ');
+      if (parts.length !== 2) return NaN;
+      const [d, t] = parts;
       const [yr, mo, da] = d.split('-').map(Number);
       const [hr, mi] = t.split(':').map(Number);
-      return new Date(Date.UTC(yr, mo - 1, da, hr, mi));
+      return Date.UTC(yr, mo - 1, da, hr, mi, 0);
+    }}
+
+    function parseRunId(id) {{
+      if (!id || id.length < 11) return NaN;
+      const yr = parseInt(id.slice(0, 4), 10);
+      const mo = parseInt(id.slice(4, 6), 10) - 1;
+      const da = parseInt(id.slice(6, 8), 10);
+      const hr = parseInt(id.slice(9, 11), 10);
+      return Date.UTC(yr, mo, da, hr, 0, 0);
     }}
 
     // Contour Selector Chips
@@ -875,7 +889,6 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
-    // Underlay & Colorbar Styling
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
@@ -904,7 +917,17 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Load Data
+    function updateDprogBadge() {{
+      const isSync = document.getElementById('chk_dprogdt').checked;
+      const statusEl = document.getElementById('dprogStatus');
+      if (!statusEl) return;
+      if (isSync && currentStepData && currentStepData.valid) {{
+        statusEl.innerHTML = `(Locked: <b>${{currentStepData.valid}}</b>)`;
+      }} else {{
+        statusEl.innerHTML = `(Lead-locked)`;
+      }}
+    }}
+
     async function loadStepData() {{
       const runId = document.getElementById('runSelect').value;
       const fxx = document.getElementById('leadSelect').value;
@@ -927,7 +950,6 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Navigation & dprog/dt Sync
     function stepLead(delta) {{
       const select = document.getElementById('leadSelect');
       let idx = select.selectedIndex + delta;
@@ -948,15 +970,20 @@ html_content = f"""<!DOCTYPE html>
 
     function onRunChanged() {{
       const syncDprog = document.getElementById('chk_dprogdt').checked;
-      if (syncDprog && currentStepData) {{
-        const currentValid = parseUtcDate(currentStepData.valid);
-        const selectedRunObj = manifestData.runs.find(r => r.id === document.getElementById('runSelect').value);
-        if (selectedRunObj) {{
-          const newInit = parseUtcDate(selectedRunObj.init);
-          const targetFxx = Math.round((currentValid - newInit) / 3600000);
+      if (syncDprog && currentStepData && currentStepData.valid) {{
+        const targetValidMs = parseUtcDate(currentStepData.valid);
+        const newRunId = document.getElementById('runSelect').value;
+        const newRunInitMs = parseRunId(newRunId);
+
+        if (!isNaN(targetValidMs) && !isNaN(newRunInitMs)) {{
+          const diffHours = Math.round((targetValidMs - newRunInitMs) / 3600000);
           
-          if (FXX_STEPS.includes(targetFxx)) {{
-            document.getElementById('leadSelect').value = String(targetFxx).padStart(3, '0');
+          if (FXX_STEPS.includes(diffHours)) {{
+            document.getElementById('leadSelect').value = String(diffHours).padStart(3, '0');
+          }} else {{
+            // Clamp to boundary if valid time falls outside 0..240h
+            const clamped = Math.max(0, Math.min(240, Math.round(diffHours / 12) * 12));
+            document.getElementById('leadSelect').value = String(clamped).padStart(3, '0');
           }}
         }}
       }}
@@ -966,11 +993,10 @@ html_content = f"""<!DOCTYPE html>
     document.addEventListener('keydown', (e) => {{
       if (e.key === 'ArrowLeft') {{ e.preventDefault(); stepLead(-1); }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); stepLead(1); }}
-      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(-1); }}    // Newer cycle
-      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }} // Older cycle
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(-1); }} // Newer cycle
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }}  // Older cycle
     }});
 
-    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -991,6 +1017,8 @@ html_content = f"""<!DOCTYPE html>
       document.getElementById('mapTitleStamp').innerHTML = 
         `500 hPa Height (m) | Lead: F${{String(currentStepData.fxx).padStart(3, '0')}}<br>` +
         `Init: ${{currentStepData.init}}Z | Valid: ${{currentStepData.valid}}`;
+
+      updateDprogBadge();
 
       const legendItems = [];
 
@@ -1103,10 +1131,9 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
-    // Initial Load & Populate Runs Dropdown from manifest.json
     async function initViewer() {{
       try {{
-        const resp = await fetch('manifest.json');
+        const resp = await fetch('manifest.json?t=' + Date.now());
         manifestData = await resp.json();
         const runSelect = document.getElementById('runSelect');
         runSelect.innerHTML = manifestData.runs.map((r, i) => 
