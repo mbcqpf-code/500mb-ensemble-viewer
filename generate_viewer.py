@@ -692,9 +692,9 @@ html_content = f"""<!DOCTYPE html>
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <b>Model Run:</b>
-        <button class="btn btn-secondary" onclick="stepRun(1)" title="Step to older run (Arrow Up)">▲ Older</button>
+        <button class="btn btn-secondary" onclick="stepRun(-1)" title="Step to newer run (Arrow Up)">▲ Newer</button>
         <select id="runSelect" onchange="onRunChanged()"></select>
-        <button class="btn btn-secondary" onclick="stepRun(-1)" title="Step to newer run (Arrow Down)">▼ Newer</button>
+        <button class="btn btn-secondary" onclick="stepRun(1)" title="Step to older run (Arrow Down)">▼ Older</button>
       </div>
 
       <div style="display: flex; gap: 10px; align-items: center; font-size: 12px;">
@@ -796,7 +796,7 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> for Forecast Leads | Use <kbd>↑</kbd> and <kbd>↓</kbd> for Model Cycles (Older/Newer).
+    Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> for Forecast Leads | Use <kbd>↑</kbd> (Newer) and <kbd>↓</kbd> (Older) for Model Cycles.
   </div>
 
   <script>
@@ -966,8 +966,8 @@ html_content = f"""<!DOCTYPE html>
     document.addEventListener('keydown', (e) => {{
       if (e.key === 'ArrowLeft') {{ e.preventDefault(); stepLead(-1); }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); stepLead(1); }}
-      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(1); }}    // Older cycle
-      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(-1); }} // Newer cycle
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(-1); }}    // Newer cycle
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }} // Older cycle
     }});
 
     // Canvas Renderer
