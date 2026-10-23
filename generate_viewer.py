@@ -32,7 +32,7 @@ os.makedirs(RUNS_DIR, exist_ok=True)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas projection dimensions (1200x800)
+# Fixed canvas dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
 # High-performance HTTP Session with connection pooling and retries
@@ -103,7 +103,6 @@ global_init_time = detect_latest_complete_cycle()
 date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
 current_cycle_id = date_dt.strftime('%Y%m%d_%H')
 
-# Define target directories for the active cycle
 CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
 CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
 CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
@@ -421,8 +420,7 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     }
 
 def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, extend='both'):
-    if grid is None or np.all(np.isnan(grid)):
-        return
+    """Renders shaded background contours. If grid is None, renders a clean basemap."""
     fig_u = plt.figure(figsize=(12, 8), dpi=100)
     ax_u = fig_u.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
     ax_u.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -430,10 +428,11 @@ def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, ext
     ax_u.add_feature(cfeature.LAND, facecolor="#f8f9fa")
     ax_u.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
 
-    if norm is not None:
-        ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, norm=norm, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
-    else:
-        ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
+    if grid is not None and not np.all(np.isnan(grid)) and not np.all(grid == 0):
+        if norm is not None:
+            ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, norm=norm, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
+        else:
+            ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
 
     ax_u.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
     ax_u.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
@@ -484,51 +483,58 @@ for fxx in FXX_STEPS:
     ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
     if phys_cluster and ai_cluster:
         physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0)
-        render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+    else:
+        physics_vs_ai_diff = None
+    render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
     # 6. Standard Spread Underlays
     for spr_key, spr_grid in spread_diags.items():
-        if spr_grid is not None:
-            render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+        render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
     # 7. Multi-Run Trend Diagnostics (Convergence, Monotonic Trend, Flip-Flop)
-    # Probe past cached cycles for the exact same valid time
+    # Search actual prior cycles present in RUNS_DIR
+    prior_cycles = sorted(
+        [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
+        reverse=True
+    )
+
     past_means = [super_mean] if super_mean is not None else []
     past_spr_inters = [spread_diags['inter']] if spread_diags['inter'] is not None else []
 
-    for k in [1, 2, 3]:
-        past_init_dt = date_dt - timedelta(hours=12 * k)
-        past_cycle_id = past_init_dt.strftime('%Y%m%d_%H')
-        past_fxx = fxx + 12 * k
-        if past_fxx <= 240:
-            past_npz_path = os.path.join(RUNS_DIR, past_cycle_id, "grids", f"f{past_fxx:03d}.npz")
-            if os.path.exists(past_npz_path):
-                try:
+    for past_id in prior_cycles[:3]:
+        try:
+            past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
+            past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
+            if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
+                past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                if os.path.exists(past_npz_path):
                     with np.load(past_npz_path) as data:
                         past_means.append(data['super_mean'])
                         past_spr_inters.append(data['spr_inter'])
-                except Exception:
-                    pass
+        except Exception:
+            pass
 
     # A. Convergence Rate (Δσ_inter vs run -12h)
     if len(past_spr_inters) >= 2:
         delta_spr_inter = past_spr_inters[0] - past_spr_inters[1]
-        render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+    else:
+        delta_spr_inter = None  # Neutral fallback basemap
+    render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
     # B. 4-Run Monotonic Trend & Flip-Flop Volatility
     if len(past_means) >= 2:
-        # Step increments: delta_i = newer - older
         increments = [past_means[i] - past_means[i+1] for i in range(len(past_means) - 1)]
         delta_net = past_means[0] - past_means[-1]
         path_length = np.sum([np.abs(inc) for inc in increments], axis=0)
-        
-        # Monotonicity ratio M in [-1, 1]
         mono_ratio = delta_net / (path_length + 1e-5)
         monotonic_trend = delta_net * np.abs(mono_ratio)
         flip_flop_energy = path_length - np.abs(delta_net)
+    else:
+        monotonic_trend = None   # Neutral fallback basemap
+        flip_flop_energy = None  # Neutral fallback basemap
 
-        render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
-        render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+    render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+    render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
     # 8. Deterministics
     det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
@@ -604,7 +610,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (WITH GHOSTING & TREND UNDERLAYS)
+# 9. GENERATE DYNAMIC HTML FRONTEND (FIXED GHOST PADDING & UNDERLAY ERROR FALLBACK)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -671,9 +677,10 @@ html_content = f"""<!DOCTYPE html>
     }}
     .chip.active {{ background: #2563eb; color: white; border-color: #3b82f6; font-weight: bold; }}
 
+    /* Updated viewer-card background to light land color so map never turns black */
     .viewer-card {{
       position: relative; width: 100%; max-width: 1200px; aspect-ratio: 1200 / 800;
-      background: #000; border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+      background: #f8f9fa; border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
     }}
     .viewer-card img, .viewer-card canvas {{
       position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -788,7 +795,6 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs" checked onchange="draw()"><span class="swatch" style="background:#d63031;"></span> ECMWF IFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
         
-        <!-- Ghost Trails Toggle -->
         <span style="border-left: 1px solid var(--border); padding-left: 10px; margin-left: 4px;"></span>
         <label class="checkbox-item" title="Draws the Superensemble Mean from the previous 3 runs for the identical valid time.">
           <input type="checkbox" id="chk_ghost" onchange="draw()"> 
@@ -927,6 +933,7 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
+    // Underlay Management with Auto-Fallback to Basemap
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
@@ -936,6 +943,13 @@ html_content = f"""<!DOCTYPE html>
       const cbarGrad = document.getElementById('cbarGrad');
       const cbarMin = document.getElementById('cbarMin');
       const cbarMax = document.getElementById('cbarMax');
+
+      // Auto-fallback: If an underlay is missing, revert cleanly to basemap so map never goes black
+      img.onerror = function() {{
+        img.onerror = null;
+        img.src = 'basemap.png';
+        cbar.style.display = 'none';
+      }};
 
       if (bg === 'none') {{
         img.src = 'basemap.png';
@@ -1151,7 +1165,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay for identical valid time)
+      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay with 3-digit zero-padding)
       if (showGhost && currentStepData && currentStepData.valid) {{
         const curIdx = manifestData.runs.findIndex(r => r.id === document.getElementById('runSelect').value);
         if (curIdx !== -1) {{
@@ -1170,7 +1184,10 @@ html_content = f"""<!DOCTYPE html>
               const pastFxx = Math.round((targetValidMs - pastInitMs) / 3600000);
 
               if (FXX_STEPS.includes(pastFxx)) {{
-                const pastCacheKey = `${{pastRunObj.id}}_${{pastFxx}}`;
+                // Properly zero-pad lead time (e.g., f012, f024, f072)
+                const fxxStr = String(pastFxx).padStart(3, '0');
+                const pastCacheKey = `${{pastRunObj.id}}_${{fxxStr}}`;
+                
                 if (dataCache[pastCacheKey]) {{
                   const pastData = dataCache[pastCacheKey];
                   if (pastData.super_mean) {{
@@ -1178,8 +1195,7 @@ html_content = f"""<!DOCTYPE html>
                     legendItems.push({{ label: `Super Mean (${{cfg.label}})`, color: cfg.color, dash: true }});
                   }}
                 }} else {{
-                  // Asynchronously fetch past JSON without blocking
-                  fetch(`runs/${{pastRunObj.id}}/data/f${{pastFxx}}.json`)
+                  fetch(`runs/${{pastRunObj.id}}/data/f${{fxxStr}}.json`)
                     .then(r => r.json())
                     .then(json => {{
                       dataCache[pastCacheKey] = json;
@@ -1192,7 +1208,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 5. Superensemble Mean (Thick Black + Inline Labels)
+      // 5. Superensemble Mean
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
@@ -1213,7 +1229,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
