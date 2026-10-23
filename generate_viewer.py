@@ -32,7 +32,7 @@ os.makedirs(RUNS_DIR, exist_ok=True)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas dimensions (1200x800)
+# Fixed canvas projection dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
 # High-performance HTTP Session with connection pooling and retries
@@ -60,7 +60,6 @@ def detect_latest_complete_cycle():
         cycle_str = cand.strftime('%Y-%m-%d %H:00')
         print(f"  • Checking candidate cycle: {cycle_str}Z...")
         
-        # Probe ECMWF IFS ENS at F240
         ifs_ready = False
         try:
             H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
@@ -73,7 +72,6 @@ def detect_latest_complete_cycle():
             print(f"    ↳ ECMWF IFS F240 not complete for {cycle_str}Z.")
             continue
 
-        # Probe NOAA AIGEFS at F240 (control member: mem000)
         aigefs_ready = False
         date_nomads = cand.strftime('%Y%m%d')
         cycle_nomads = cand.strftime('%H')
@@ -109,8 +107,10 @@ current_cycle_id = date_dt.strftime('%Y%m%d_%H')
 CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
 CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
 CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
+CURRENT_GRIDS_DIR = os.path.join(CURRENT_RUN_DIR, "grids")
 os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
+os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -358,14 +358,21 @@ def fetch_aigfs(fxx):
 
 
 # ==============================================================================
-# 6. SPREAD & UNDERLAY RENDER ENGINE (SEQUENTIAL & DIVERGING)
+# 6. SPREAD & TREND UNDERLAY RENDER ENGINES
 # ==============================================================================
-SPREAD_LEVELS = np.arange(10, 130, 10)  # 10m to 120m intervals
+SPREAD_LEVELS = np.arange(10, 130, 10)
 SPREAD_CMAP = plt.cm.YlOrRd
 
-DIFF_LEVELS = np.arange(-80, 85, 10)  # -80m to +80m difference intervals
+DIFF_LEVELS = np.arange(-80, 85, 10)
 DIFF_CMAP = plt.cm.RdBu_r
 DIFF_NORM = mcolors.TwoSlopeNorm(vmin=-80, vcenter=0, vmax=80)
+
+CONV_LEVELS = np.arange(-30, 35, 5)
+CONV_CMAP = plt.cm.PRGn_r  # Green = Converging (<0), Purple = Diverging (>0)
+CONV_NORM = mcolors.TwoSlopeNorm(vmin=-30, vcenter=0, vmax=30)
+
+FLIP_LEVELS = np.arange(10, 90, 10)
+FLIP_CMAP = plt.cm.YlOrRd
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
@@ -387,19 +394,16 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
         if spr is not None:
             intra_vars.append(spr**2)
 
-    # Inter-Model Disagreement
     if len(means) > 1:
         spr_inter = np.std(np.stack(means), axis=0, ddof=1)
     else:
         spr_inter = np.zeros_like(target_lats)
 
-    # Pooled Internal Chaos
     if intra_vars:
         spr_intra_pooled = np.sqrt(np.mean(np.stack(intra_vars), axis=0))
     else:
         spr_intra_pooled = np.zeros_like(target_lats)
 
-    # Total Superensemble Spread
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     if len(all_members) > 1:
         spr_total = np.std(np.stack(all_members), axis=0, ddof=1)
@@ -416,53 +420,28 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
         "aifs": spr_aifs
     }
 
-def render_spread_underlay(spread_grid, filename, target_dir):
-    if spread_grid is None or np.all(np.isnan(spread_grid)):
+def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, extend='both'):
+    if grid is None or np.all(np.isnan(grid)):
         return
-    fig_spr = plt.figure(figsize=(12, 8), dpi=100)
-    ax_spr = fig_spr.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
-    ax_spr.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    fig_u = plt.figure(figsize=(12, 8), dpi=100)
+    ax_u = fig_u.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
+    ax_u.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-    ax_spr.add_feature(cfeature.LAND, facecolor="#f8f9fa")
-    ax_spr.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
-    
-    ax_spr.contourf(
-        target_lons, target_lats, spread_grid,
-        levels=SPREAD_LEVELS, cmap=SPREAD_CMAP,
-        transform=ccrs.PlateCarree(), extend='max', alpha=0.85
-    )
-    
-    ax_spr.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
-    ax_spr.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
-    ax_spr.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
-    ax_spr.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
+    ax_u.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax_u.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
 
-    fig_spr.savefig(os.path.join(target_dir, filename), dpi=100)
-    plt.close(fig_spr)
+    if norm is not None:
+        ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, norm=norm, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
+    else:
+        ax_u.contourf(target_lons, target_lats, grid, levels=levels, cmap=cmap, transform=ccrs.PlateCarree(), extend=extend, alpha=0.85)
 
-def render_diff_underlay(diff_grid, filename, target_dir):
-    if diff_grid is None or np.all(np.isnan(diff_grid)):
-        return
-    fig_d = plt.figure(figsize=(12, 8), dpi=100)
-    ax_d = fig_d.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
-    ax_d.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    ax_u.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
+    ax_u.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
+    ax_u.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
+    ax_u.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
 
-    ax_d.add_feature(cfeature.LAND, facecolor="#f8f9fa")
-    ax_d.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
-
-    ax_d.contourf(
-        target_lons, target_lats, diff_grid,
-        levels=DIFF_LEVELS, cmap=DIFF_CMAP, norm=DIFF_NORM,
-        transform=ccrs.PlateCarree(), extend='both', alpha=0.85
-    )
-
-    ax_d.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
-    ax_d.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
-    ax_d.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
-    ax_d.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
-
-    fig_d.savefig(os.path.join(target_dir, filename), dpi=100)
-    plt.close(fig_d)
+    fig_u.savefig(os.path.join(target_dir, filename), dpi=100)
+    plt.close(fig_u)
 
 
 # ==============================================================================
@@ -489,26 +468,75 @@ for fxx in FXX_STEPS:
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # 3. Physics vs AI Difference Calculation
+    # 3. Spread Diagnostics
+    spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
+
+    # 4. Save compact 2D grids for trend / archive calculations
+    if super_mean is not None and spread_diags['inter'] is not None:
+        np.savez_compressed(
+            os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
+            super_mean=super_mean.astype(np.float32),
+            spr_inter=spread_diags['inter'].astype(np.float32)
+        )
+
+    # 5. Physics vs AI Difference Underlay
     phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
     ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
     if phys_cluster and ai_cluster:
         physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0)
-        render_diff_underlay(physics_vs_ai_diff, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+        render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
-    # 4. Compute and render Spread Underlays
-    spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
+    # 6. Standard Spread Underlays
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
-            render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+            render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-    # 5. Fetch deterministics
+    # 7. Multi-Run Trend Diagnostics (Convergence, Monotonic Trend, Flip-Flop)
+    # Probe past cached cycles for the exact same valid time
+    past_means = [super_mean] if super_mean is not None else []
+    past_spr_inters = [spread_diags['inter']] if spread_diags['inter'] is not None else []
+
+    for k in [1, 2, 3]:
+        past_init_dt = date_dt - timedelta(hours=12 * k)
+        past_cycle_id = past_init_dt.strftime('%Y%m%d_%H')
+        past_fxx = fxx + 12 * k
+        if past_fxx <= 240:
+            past_npz_path = os.path.join(RUNS_DIR, past_cycle_id, "grids", f"f{past_fxx:03d}.npz")
+            if os.path.exists(past_npz_path):
+                try:
+                    with np.load(past_npz_path) as data:
+                        past_means.append(data['super_mean'])
+                        past_spr_inters.append(data['spr_inter'])
+                except Exception:
+                    pass
+
+    # A. Convergence Rate (Δσ_inter vs run -12h)
+    if len(past_spr_inters) >= 2:
+        delta_spr_inter = past_spr_inters[0] - past_spr_inters[1]
+        render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+
+    # B. 4-Run Monotonic Trend & Flip-Flop Volatility
+    if len(past_means) >= 2:
+        # Step increments: delta_i = newer - older
+        increments = [past_means[i] - past_means[i+1] for i in range(len(past_means) - 1)]
+        delta_net = past_means[0] - past_means[-1]
+        path_length = np.sum([np.abs(inc) for inc in increments], axis=0)
+        
+        # Monotonicity ratio M in [-1, 1]
+        mono_ratio = delta_net / (path_length + 1e-5)
+        monotonic_trend = delta_net * np.abs(mono_ratio)
+        flip_flop_energy = path_length - np.abs(delta_net)
+
+        render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+        render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+
+    # 8. Deterministics
     det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
     det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
     det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
     det_aigfs = fetch_aigfs(fxx)
 
-    # 6. Extract vector contours
+    # 9. Extract vector contours
     super_contours = extract_contours(super_mean)
     print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
@@ -576,7 +604,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (FIXED DPROG/DT VALID TIME SYNC)
+# 9. GENERATE DYNAMIC HTML FRONTEND (WITH GHOSTING & TREND UNDERLAYS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -656,7 +684,7 @@ html_content = f"""<!DOCTYPE html>
       position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
       color: #111; padding: 6px 10px; border-radius: 6px; font-size: 11px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3px;
-      pointer-events: none; max-width: 250px;
+      pointer-events: none; max-width: 260px;
     }}
     .legend-line {{ display: flex; align-items: center; gap: 7px; }}
     .line-sample {{ width: 20px; height: 3px; display: inline-block; }}
@@ -696,7 +724,7 @@ html_content = f"""<!DOCTYPE html>
       </div>
 
       <div style="display: flex; gap: 8px; align-items: center; font-size: 12px; background: #0f172a; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);">
-        <label style="cursor: pointer; display: flex; align-items: center; gap: 6px;" title="When changing model runs, automatically shifts lead time to track the exact same valid time.">
+        <label style="cursor: pointer; display: flex; align-items: center; gap: 6px;" title="Automatically shifts lead time when changing cycles to track the exact same valid time.">
           <input type="checkbox" id="chk_dprogdt" checked onchange="updateDprogBadge()"> 
           <span style="color: #60a5fa; font-weight: bold;">dprog/dt Mode:</span> Sync Valid Time
         </label>
@@ -707,6 +735,9 @@ html_content = f"""<!DOCTYPE html>
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
           <option value="none">Basemap Only</option>
+          <option value="monotonic_trend">4-Run Consistent Trend (Deepening vs Building)</option>
+          <option value="flipflop">4-Run Flip-Flop Volatility (Oscillation Energy)</option>
+          <option value="convergence">Model Convergence Rate (Δσ_inter: Green=Agree, Purple=Dis)</option>
           <option value="physics_vs_ai">Physics minus AI (Phys - AI)</option>
           <option value="inter">Inter-Model Disagreement (σ_inter)</option>
           <option value="total">Total Super Spread (σ_total)</option>
@@ -743,7 +774,7 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 3: Structured Model Toggles (Ensembles vs Deterministics) -->
+    <!-- Row 3: Structured Model Toggles & Ghost Trails -->
     <div class="model-group-row">
       <div class="group-line">
         <span class="group-label">
@@ -756,6 +787,14 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigefs" checked onchange="draw()"><span class="swatch" style="background:#8e44ad;"></span> AIGEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs" checked onchange="draw()"><span class="swatch" style="background:#d63031;"></span> ECMWF IFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
+        
+        <!-- Ghost Trails Toggle -->
+        <span style="border-left: 1px solid var(--border); padding-left: 10px; margin-left: 4px;"></span>
+        <label class="checkbox-item" title="Draws the Superensemble Mean from the previous 3 runs for the identical valid time.">
+          <input type="checkbox" id="chk_ghost" onchange="draw()"> 
+          <span class="swatch" style="background:#64748b; border: 1px dashed #fff;"></span> 
+          <b>Past 3 Runs Ghost Trails (dprog/dt)</b>
+        </label>
       </div>
 
       <div class="group-line">
@@ -808,7 +847,6 @@ html_content = f"""<!DOCTYPE html>
     let currentStepData = null;
     let manifestData = {{ runs: [] }};
 
-    // Robust UTC Date & Run ID Parsers
     function parseUtcDate(str) {{
       if (!str) return NaN;
       const clean = str.replace(/[Zz]/g, '').trim();
@@ -902,12 +940,24 @@ html_content = f"""<!DOCTYPE html>
       if (bg === 'none') {{
         img.src = 'basemap.png';
         cbar.style.display = 'none';
-      }} else if (bg === 'physics_vs_ai') {{
-        img.src = `runs/${{runId}}/spread/physics_vs_ai_f${{fxx}}.png`;
+      }} else if (bg === 'physics_vs_ai' || bg === 'monotonic_trend') {{
+        img.src = `runs/${{runId}}/spread/${{bg}}_f${{fxx}}.png`;
         cbar.style.display = 'flex';
         cbarGrad.style.background = 'linear-gradient(to right, #2166ac, #67a9cf, #d1e5f0, #f7f7f7, #fddbc7, #ef8a62, #b2182b)';
-        cbarMin.textContent = '-80m (AI)';
-        cbarMax.textContent = '+80m (Phys)';
+        cbarMin.textContent = bg === 'monotonic_trend' ? '-80m (Deep)' : '-80m (AI)';
+        cbarMax.textContent = bg === 'monotonic_trend' ? '+80m (Build)' : '+80m (Phys)';
+      }} else if (bg === 'convergence') {{
+        img.src = `runs/${{runId}}/spread/convergence_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #27ae60, #a9dfbf, #f7f7f7, #d7bde2, #8e44ad)';
+        cbarMin.textContent = '-30m (Agree)';
+        cbarMax.textContent = '+30m (Dis)';
+      }} else if (bg === 'flipflop') {{
+        img.src = `runs/${{runId}}/spread/flipflop_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026)';
+        cbarMin.textContent = '10m';
+        cbarMax.textContent = '80m+ (Flip)';
       }} else {{
         img.src = `runs/${{runId}}/spread/${{bg}}_f${{fxx}}.png`;
         cbar.style.display = 'flex';
@@ -977,11 +1027,9 @@ html_content = f"""<!DOCTYPE html>
 
         if (!isNaN(targetValidMs) && !isNaN(newRunInitMs)) {{
           const diffHours = Math.round((targetValidMs - newRunInitMs) / 3600000);
-          
           if (FXX_STEPS.includes(diffHours)) {{
             document.getElementById('leadSelect').value = String(diffHours).padStart(3, '0');
           }} else {{
-            // Clamp to boundary if valid time falls outside 0..240h
             const clamped = Math.max(0, Math.min(240, Math.round(diffHours / 12) * 12));
             document.getElementById('leadSelect').value = String(clamped).padStart(3, '0');
           }}
@@ -993,10 +1041,11 @@ html_content = f"""<!DOCTYPE html>
     document.addEventListener('keydown', (e) => {{
       if (e.key === 'ArrowLeft') {{ e.preventDefault(); stepLead(-1); }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); stepLead(1); }}
-      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(-1); }} // Newer cycle
-      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }}  // Older cycle
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepRun(-1); }}
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }}
     }});
 
+    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -1013,6 +1062,7 @@ html_content = f"""<!DOCTYPE html>
       const showAigfs = document.getElementById('chk_aigfs').checked;
       const showEcmwf = document.getElementById('chk_ecmwf_det').checked;
       const showAifsDet = document.getElementById('chk_aifs_det').checked;
+      const showGhost = document.getElementById('chk_ghost').checked;
 
       document.getElementById('mapTitleStamp').innerHTML = 
         `500 hPa Height (m) | Lead: F${{String(currentStepData.fxx).padStart(3, '0')}}<br>` +
@@ -1022,12 +1072,12 @@ html_content = f"""<!DOCTYPE html>
 
       const legendItems = [];
 
-      function drawLines(layerDict, color, width, alpha, dashed = false) {{
+      function drawLines(layerDict, color, width, alpha, dashArray = []) {{
         if (!layerDict) return;
         ctx.strokeStyle = color;
         ctx.lineWidth = width;
         ctx.globalAlpha = alpha;
-        ctx.setLineDash(dashed ? [6, 4] : []);
+        ctx.setLineDash(dashArray);
 
         selectedContours.forEach(lvl => {{
           const lines = layerDict[String(lvl)];
@@ -1067,19 +1117,19 @@ html_content = f"""<!DOCTYPE html>
 
       // 2. Deterministics (Dashed)
       if (showGfs && currentStepData.gfs_det) {{
-        drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, true);
+        drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, [6, 4]);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
       }}
       if (showAigfs && currentStepData.aigfs_det) {{
-        drawLines(currentStepData.aigfs_det, '#4a235a', 2.0, 1.0, true);
+        drawLines(currentStepData.aigfs_det, '#4a235a', 2.0, 1.0, [6, 4]);
         legendItems.push({{ label: 'AIGFS Det', color: '#4a235a', dash: true }});
       }}
       if (showEcmwf && currentStepData.ecmwf_det) {{
-        drawLines(currentStepData.ecmwf_det, '#78281f', 2.0, 1.0, true);
+        drawLines(currentStepData.ecmwf_det, '#78281f', 2.0, 1.0, [6, 4]);
         legendItems.push({{ label: 'IFS Det', color: '#78281f', dash: true }});
       }}
       if (showAifsDet && currentStepData.aifs_det) {{
-        drawLines(currentStepData.aifs_det, '#145a32', 2.0, 1.0, true);
+        drawLines(currentStepData.aifs_det, '#145a32', 2.0, 1.0, [6, 4]);
         legendItems.push({{ label: 'AIFS Det', color: '#145a32', dash: true }});
       }}
 
@@ -1101,7 +1151,48 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // 4. Superensemble Mean
+      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay for identical valid time)
+      if (showGhost && currentStepData && currentStepData.valid) {{
+        const curIdx = manifestData.runs.findIndex(r => r.id === document.getElementById('runSelect').value);
+        if (curIdx !== -1) {{
+          const ghostConfigs = [
+            {{ offset: 1, label: '-12h Run', color: '#334155', width: 2.0, dash: [6, 4], alpha: 0.85 }},
+            {{ offset: 2, label: '-24h Run', color: '#64748b', width: 1.6, dash: [4, 4], alpha: 0.70 }},
+            {{ offset: 3, label: '-36h Run', color: '#94a3b8', width: 1.3, dash: [2, 3], alpha: 0.55 }}
+          ];
+
+          ghostConfigs.forEach(cfg => {{
+            const pastRunIdx = curIdx + cfg.offset;
+            if (pastRunIdx < manifestData.runs.length) {{
+              const pastRunObj = manifestData.runs[pastRunIdx];
+              const targetValidMs = parseUtcDate(currentStepData.valid);
+              const pastInitMs = parseRunId(pastRunObj.id);
+              const pastFxx = Math.round((targetValidMs - pastInitMs) / 3600000);
+
+              if (FXX_STEPS.includes(pastFxx)) {{
+                const pastCacheKey = `${{pastRunObj.id}}_${{pastFxx}}`;
+                if (dataCache[pastCacheKey]) {{
+                  const pastData = dataCache[pastCacheKey];
+                  if (pastData.super_mean) {{
+                    drawLines(pastData.super_mean, cfg.color, cfg.width, cfg.alpha, cfg.dash);
+                    legendItems.push({{ label: `Super Mean (${{cfg.label}})`, color: cfg.color, dash: true }});
+                  }}
+                }} else {{
+                  // Asynchronously fetch past JSON without blocking
+                  fetch(`runs/${{pastRunObj.id}}/data/f${{pastFxx}}.json`)
+                    .then(r => r.json())
+                    .then(json => {{
+                      dataCache[pastCacheKey] = json;
+                      draw();
+                    }}).catch(() => {{}});
+                }}
+              }}
+            }}
+          }});
+        }}
+      }}
+
+      // 5. Superensemble Mean (Thick Black + Inline Labels)
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
@@ -1122,6 +1213,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
+      // Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
