@@ -111,16 +111,24 @@ os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
-# Idempotency Check
+# Idempotency Check: Verify that all data files exist AND that consensus_metrics has composite scores
 skip_download_and_generation = False
 if os.path.exists(CURRENT_DATA_DIR) and os.path.exists(CURRENT_SPREAD_DIR):
     all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
     all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
-    metrics_exist = os.path.exists(os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json"))
-    if all_json_exist and all_png_exist and metrics_exist:
-        skip_download_and_generation = True
-        print(f"⚡ Cycle {current_cycle_id} already exists with complete 240h data!")
-        print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
+    metrics_file = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
+    if all_json_exist and all_png_exist and os.path.exists(metrics_file):
+        try:
+            with open(metrics_file, "r") as mf:
+                mdata = json.load(mf)
+                sample_step = mdata.get("metrics", {}).get("000", {})
+                sample_m = sample_step.get("gefs_mean", {})
+                if "score" in sample_m:
+                    skip_download_and_generation = True
+                    print(f"⚡ Cycle {current_cycle_id} already exists with complete 240h data and composite scores!")
+                    print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
+        except Exception:
+            pass
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -368,7 +376,7 @@ def fetch_aigfs(fxx):
 
 
 # ==============================================================================
-# 6. SPREAD & TREND UNDERLAY RENDER ENGINES
+# 6. SPREAD, TREND & CONSENSUS ENGINE
 # ==============================================================================
 SPREAD_LEVELS = np.arange(10, 130, 10)
 SPREAD_CMAP = plt.cm.YlOrRd
@@ -411,19 +419,37 @@ ENS_OUTLIER_COLORS = {
 }
 
 def compute_consensus_metrics(model_grid, super_mean):
-    """Computes centered spatial pattern correlation (r) and spatial RMS error (meters)."""
+    """
+    Computes:
+      1. Zonal Anomaly (Eddy) Pattern Correlation (r_eddy): isolates troughs/ridges by removing latitudinal mean.
+      2. Spatial Root-Mean-Square Difference (RMSD): measures absolute height and amplitude departure in meters.
+      3. Composite Consensus Match Score (0 - 100%): 60% r_eddy + 40% RMSD.
+    """
     if model_grid is None or super_mean is None or np.all(np.isnan(model_grid)) or np.all(np.isnan(super_mean)):
-        return {"r": None, "rmsd": None}
+        return {"r": None, "rmsd": None, "score": None}
     try:
-        m_prime = model_grid - np.nanmean(model_grid)
-        s_prime = super_mean - np.nanmean(super_mean)
-        num = np.nansum(m_prime * s_prime)
-        denom = np.sqrt(np.nansum(m_prime**2) * np.nansum(s_prime**2)) + 1e-6
-        r_val = float(np.clip(num / denom, -1.0, 1.0))
+        # Subtract the zonal mean across longitudes for each latitude row (axis=1)
+        m_eddy = model_grid - np.nanmean(model_grid, axis=1, keepdims=True)
+        s_eddy = super_mean - np.nanmean(super_mean, axis=1, keepdims=True)
+        
+        num = np.nansum(m_eddy * s_eddy)
+        denom = np.sqrt(np.nansum(m_eddy**2) * np.nansum(s_eddy**2)) + 1e-6
+        r_eddy = float(np.clip(num / denom, -1.0, 1.0))
+        
         rmsd_val = float(np.sqrt(np.nanmean((model_grid - super_mean)**2)))
-        return {"r": round(r_val, 3), "rmsd": round(rmsd_val, 1)}
+        
+        # Composite score calculation (0 - 100%)
+        r_comp = max(0.0, r_eddy)
+        rmsd_comp = max(0.0, 1.0 - (rmsd_val / 60.0))
+        score = int(round(100.0 * (0.60 * r_comp + 0.40 * rmsd_comp)))
+        
+        return {
+            "r": round(r_eddy, 2),
+            "rmsd": round(rmsd_val, 1),
+            "score": score
+        }
     except Exception:
-        return {"r": None, "rmsd": None}
+        return {"r": None, "rmsd": None, "score": None}
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
@@ -640,7 +666,7 @@ if not skip_download_and_generation:
         det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
         det_aigfs = fetch_aigfs(fxx)
 
-        # 4. Consensus Metrics (Pattern correlation r and RMSD vs Super Mean)
+        # 4. Compute Zonal Anomaly Correlation & Composite Match Scores vs Super Mean
         step_metrics = {
             "gefs_mean": compute_consensus_metrics(gefs_mean, super_mean),
             "aigefs_mean": compute_consensus_metrics(aigefs_mean, super_mean),
@@ -795,7 +821,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (WITH MODAL CHART & LIVE CONSENSUS METRICS)
+# 9. GENERATE DYNAMIC HTML FRONTEND (WITH EDDY & COMPOSITE SCORE INTEGRATION)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -880,11 +906,11 @@ html_content = f"""<!DOCTYPE html>
     .legend-box {{
       position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.95);
       color: #111; padding: 6px 10px; border-radius: 6px; font-size: 11px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3px;
-      pointer-events: none; max-width: 320px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3.5px;
+      pointer-events: none; max-width: 340px;
     }}
     .legend-line {{ display: flex; align-items: center; gap: 7px; }}
-    .line-sample {{ width: 20px; height: 3px; display: inline-block; flex-shrink: 0; }}
+    .line-sample {{ width: 18px; height: 3px; display: inline-block; flex-shrink: 0; }}
 
     .title-stamp {{
       position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.94);
@@ -1132,11 +1158,12 @@ html_content = f"""<!DOCTYPE html>
       <div class="modal-controls">
         <div style="display: flex; gap: 14px; align-items: center; font-size: 13px;">
           <b>Metric:</b>
-          <label style="cursor: pointer;"><input type="radio" name="metricType" value="r" checked onchange="renderConsensusChart()"> Centered Pattern Correlation (r)</label>
+          <label style="cursor: pointer;"><input type="radio" name="metricType" value="score" checked onchange="renderConsensusChart()"> Composite Match Score (0–100%)</label>
+          <label style="cursor: pointer;"><input type="radio" name="metricType" value="r" onchange="renderConsensusChart()"> Zonal Anomaly Correlation (r_eddy)</label>
           <label style="cursor: pointer;"><input type="radio" name="metricType" value="rmsd" onchange="renderConsensusChart()"> Spatial RMS Difference (meters)</label>
         </div>
         <div style="font-size: 11px; color: var(--text-muted);">
-          Evaluates model wave phase alignment and amplitude bias against the 164-member Super Mean.
+          Composite score blends 60% wave geometry (r_eddy) and 40% wave depth (RMSD).
         </div>
       </div>
       <div class="chart-wrapper">
@@ -1498,10 +1525,11 @@ html_content = f"""<!DOCTYPE html>
     }});
 
     // Helper to format live consensus correlation & rmsd for legend
-    function formatConsensusMeta(m) {{
-      if (!m || m.r === null || m.r === undefined) return '';
-      const rStr = m.r >= 0 ? `r=${{m.r.toFixed(2)}}` : `r=${{m.r.toFixed(2)}}`;
-      return ` <span style="font-size:10px; color:#475569; font-weight:normal;">(${{rStr}}, ±${{Math.round(m.rmsd)}}m)</span>`;
+    function formatConsensusMeta(m, isTop) {{
+      if (!m || m.score === null || m.score === undefined) return '';
+      const rStr = m.r >= 0 ? `+${{m.r.toFixed(2)}}` : `${{m.r.toFixed(2)}}`;
+      const medal = isTop ? ' 🥇' : '';
+      return ` <span style="font-size:10.5px; color:#334155; font-weight:bold;">[${{m.score}}%]</span> <span style="font-size:10px; color:#64748b; font-weight:normal;">(r=${{rStr}}, ±${{Math.round(m.rmsd)}}m)${{medal}}</span>`;
     }}
 
     // Canvas Renderer
@@ -1531,6 +1559,26 @@ html_content = f"""<!DOCTYPE html>
 
       const legendItems = [];
       const m = currentStepData.metrics || {{}};
+
+      // Find top scoring active model for gold badge
+      let topScore = -1;
+      let topModelKey = null;
+      const activeKeys = [];
+      if (showGefs) activeKeys.push('gefs_mean');
+      if (showAigefs) activeKeys.push('aigefs_mean');
+      if (showIfs) activeKeys.push('ifs_mean');
+      if (showAifs) activeKeys.push('aifs_mean');
+      if (showGfs) activeKeys.push('gfs_det');
+      if (showAigfs) activeKeys.push('aigfs_det');
+      if (showEcmwf) activeKeys.push('ecmwf_det');
+      if (showAifsDet) activeKeys.push('aifs_det');
+
+      activeKeys.forEach(k => {{
+        if (m[k] && m[k].score !== null && m[k].score > topScore) {{
+          topScore = m[k].score;
+          topModelKey = k;
+        }}
+      }});
 
       function drawLines(layerDict, color, width, alpha, dashArray = []) {{
         if (!layerDict) return;
@@ -1578,37 +1626,37 @@ html_content = f"""<!DOCTYPE html>
       // 2. Deterministics (Dashed with Live Consensus Metrics)
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: `GFS Det${{formatConsensusMeta(m.gfs_det)}}`, color: '#001155', dash: true }});
+        legendItems.push({{ label: `GFS Det${{formatConsensusMeta(m.gfs_det, topModelKey === 'gfs_det')}}`, color: '#001155', dash: true }});
       }}
       if (showAigfs && currentStepData.aigfs_det) {{
         drawLines(currentStepData.aigfs_det, '#4a235a', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: `AIGFS Det${{formatConsensusMeta(m.aigfs_det)}}`, color: '#4a235a', dash: true }});
+        legendItems.push({{ label: `AIGFS Det${{formatConsensusMeta(m.aigfs_det, topModelKey === 'aigfs_det')}}`, color: '#4a235a', dash: true }});
       }}
       if (showEcmwf && currentStepData.ecmwf_det) {{
         drawLines(currentStepData.ecmwf_det, '#78281f', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: `IFS Det${{formatConsensusMeta(m.ecmwf_det)}}`, color: '#78281f', dash: true }});
+        legendItems.push({{ label: `IFS Det${{formatConsensusMeta(m.ecmwf_det, topModelKey === 'ecmwf_det')}}`, color: '#78281f', dash: true }});
       }}
       if (showAifsDet && currentStepData.aifs_det) {{
         drawLines(currentStepData.aifs_det, '#145a32', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: `AIFS Det${{formatConsensusMeta(m.aifs_det)}}`, color: '#145a32', dash: true }});
+        legendItems.push({{ label: `AIFS Det${{formatConsensusMeta(m.aifs_det, topModelKey === 'aifs_det')}}`, color: '#145a32', dash: true }});
       }}
 
       // 3. Ensemble Means (with Live Consensus Metrics)
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0044ff', 2.4, 1.0);
-        legendItems.push({{ label: `GEFS Mean${{formatConsensusMeta(m.gefs_mean)}}`, color: '#0044ff', dash: false }});
+        legendItems.push({{ label: `GEFS Mean${{formatConsensusMeta(m.gefs_mean, topModelKey === 'gefs_mean')}}`, color: '#0044ff', dash: false }});
       }}
       if (showAigefs && currentStepData.aigefs_mean) {{
         drawLines(currentStepData.aigefs_mean, '#8e44ad', 2.4, 1.0);
-        legendItems.push({{ label: `AIGEFS Mean${{formatConsensusMeta(m.aigefs_mean)}}`, color: '#8e44ad', dash: false }});
+        legendItems.push({{ label: `AIGEFS Mean${{formatConsensusMeta(m.aigefs_mean, topModelKey === 'aigefs_mean')}}`, color: '#8e44ad', dash: false }});
       }}
       if (showIfs && currentStepData.ifs_mean) {{
         drawLines(currentStepData.ifs_mean, '#d63031', 2.4, 1.0);
-        legendItems.push({{ label: `IFS Mean${{formatConsensusMeta(m.ifs_mean)}}`, color: '#d63031', dash: false }});
+        legendItems.push({{ label: `IFS Mean${{formatConsensusMeta(m.ifs_mean, topModelKey === 'ifs_mean')}}`, color: '#d63031', dash: false }});
       }}
       if (showAifs && currentStepData.aifs_mean) {{
         drawLines(currentStepData.aifs_mean, '#00b894', 2.4, 1.0);
-        legendItems.push({{ label: `AIFS Mean${{formatConsensusMeta(m.aifs_mean)}}`, color: '#00b894', dash: false }});
+        legendItems.push({{ label: `AIFS Mean${{formatConsensusMeta(m.aifs_mean, topModelKey === 'aifs_mean')}}`, color: '#00b894', dash: false }});
       }}
 
       // 4. Past 3 Runs Ghost Trails (dprog/dt overlay)
@@ -1731,15 +1779,16 @@ html_content = f"""<!DOCTYPE html>
       const metricType = document.querySelector('input[name="metricType"]:checked').value;
       const currentLead = parseInt(document.getElementById('leadSelect').value, 10);
 
-      // Margins
       const padL = 60, padR = 30, padT = 30, padB = 45;
       const plotW = W - padL - padR;
       const plotH = H - padT - padB;
 
-      // Coordinate scaling
       const xMin = 0, xMax = 240;
-      let yMin = 0.60, yMax = 1.00;
-      if (metricType === 'rmsd') {{
+      let yMin = 0, yMax = 100;
+      if (metricType === 'r') {{
+        yMin = -0.20;
+        yMax = 1.00;
+      }} else if (metricType === 'rmsd') {{
         yMin = 0;
         yMax = 90;
       }}
@@ -1766,8 +1815,19 @@ html_content = f"""<!DOCTYPE html>
       }}
 
       // Y Gridlines
-      if (metricType === 'r') {{
-        const yTicks = [0.60, 0.70, 0.80, 0.90, 0.95, 1.00];
+      if (metricType === 'score') {{
+        const yTicks = [0, 25, 50, 75, 100];
+        yTicks.forEach(val => {{
+          const y = getY(val);
+          ctx.beginPath();
+          ctx.moveTo(padL, y);
+          ctx.lineTo(W - padR, y);
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText(`${{val}}%`, padL - 8, y + 4);
+        }});
+      }} else if (metricType === 'r') {{
+        const yTicks = [-0.20, 0.00, 0.25, 0.50, 0.75, 1.00];
         yTicks.forEach(val => {{
           const y = getY(val);
           ctx.beginPath();
@@ -1797,7 +1857,10 @@ html_content = f"""<!DOCTYPE html>
       ctx.textAlign = 'center';
       ctx.font = 'bold 12px sans-serif';
       ctx.fillStyle = '#cbd5e1';
-      ctx.fillText(metricType === 'r' ? 'Centered Pattern Correlation (r)' : 'Spatial RMS Difference (meters)', 0, 0);
+      let yAxisTitle = 'Composite Consensus Score (%)';
+      if (metricType === 'r') yAxisTitle = 'Zonal Anomaly Correlation (r_eddy)';
+      else if (metricType === 'rmsd') yAxisTitle = 'Spatial RMS Difference (meters)';
+      ctx.fillText(yAxisTitle, 0, 0);
       ctx.restore();
 
       // Current Lead Indicator Line
