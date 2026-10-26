@@ -45,7 +45,7 @@ http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; 
 
 
 # ==============================================================================
-# 2. DYNAMIC CYCLE DETECTOR (ECMWF IFS F240 COMPLETION TRIGGER)
+# 2. DYNAMIC CYCLE DETECTOR & IDEMPOTENCY CHECK
 # ==============================================================================
 def detect_latest_complete_cycle():
     """Probes candidate synoptic cycles and locks onto the latest completed F240 run."""
@@ -110,6 +110,16 @@ CURRENT_GRIDS_DIR = os.path.join(CURRENT_RUN_DIR, "grids")
 os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
+
+# Idempotency Check: Check if all 21 JSON and PNG files already exist for this cycle
+skip_download_and_generation = False
+if os.path.exists(CURRENT_DATA_DIR) and os.path.exists(CURRENT_SPREAD_DIR):
+    all_json_exist = all(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json") and os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
+    all_png_exist = all(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png") and os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
+    if all_json_exist and all_png_exist:
+        skip_download_and_generation = True
+        print(f"⚡ Cycle {current_cycle_id} already exists with complete 240h data!")
+        print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -374,10 +384,10 @@ FLIP_LEVELS = np.arange(10, 90, 10)
 FLIP_CMAP = plt.cm.YlOrRd
 
 DET_OUTLIER_PALETTES = {
-    'gfs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],      # GFS Det (Blue)
-    'aigfs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],    # AIGFS Det (Purple)
-    'ecmwf': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],    # IFS Det (Red)
-    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']      # AIFS Det (Green)
+    'gfs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],
+    'aigfs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],
+    'ecmwf': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],
+    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']
 }
 DET_OUTLIER_COLORS = {
     'gfs': '#001155',
@@ -387,10 +397,10 @@ DET_OUTLIER_COLORS = {
 }
 
 ENS_OUTLIER_PALETTES = {
-    'gefs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],      # GEFS (Blue)
-    'aigefs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],    # AIGEFS (Purple)
-    'ifs': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],       # IFS (Red)
-    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']       # AIFS (Green)
+    'gefs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],
+    'aigefs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],
+    'ifs': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],
+    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']
 }
 ENS_OUTLIER_COLORS = {
     'gefs': '#0044ff',
@@ -446,7 +456,6 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     }
 
 def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, extend='both'):
-    """Renders shaded background contours. If grid is None, renders a clean basemap."""
     fig_u = plt.figure(figsize=(12, 8), dpi=100)
     ax_u = fig_u.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
     ax_u.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -469,10 +478,6 @@ def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, ext
     plt.close(fig_u)
 
 def render_deterministic_outliers(det_dict, super_mean, spr_total, filename, target_dir):
-    """
-    Renders standardized departure outliers (|Z| >= 2.0).
-    Dominant outlier gets shaded color fill; co-outliers get colored boundary contour lines.
-    """
     fig_o = plt.figure(figsize=(12, 8), dpi=100)
     ax_o = fig_o.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
     ax_o.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -491,7 +496,6 @@ def render_deterministic_outliers(det_dict, super_mean, spr_total, filename, tar
         dom_idx = np.argmax(abs_stack, axis=0)
         max_abs_z = np.max(abs_stack, axis=0)
         
-        # 1. Fill dominant outlier where |Z| >= 2.0
         for i, k in enumerate(model_keys):
             mask_dom = (dom_idx == i) & (max_abs_z >= 2.0)
             if np.any(mask_dom):
@@ -508,7 +512,6 @@ def render_deterministic_outliers(det_dict, super_mean, spr_total, filename, tar
                 except Exception:
                     pass
 
-        # 2. Draw contour boundaries for ALL models breaching 2.0 (reveals co-outliers)
         for k, abs_z in abs_z_dict.items():
             if np.any(abs_z >= 2.0):
                 line_color = DET_OUTLIER_COLORS.get(k, '#000000')
@@ -533,10 +536,6 @@ def render_deterministic_outliers(det_dict, super_mean, spr_total, filename, tar
     plt.close(fig_o)
 
 def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
-    """
-    Renders ensemble mean 'lone wolf' outliers where one ensemble mean deviates
-    significantly from the consensus of the other 3 (3-vs-1 isolation).
-    """
     fig_e = plt.figure(figsize=(12, 8), dpi=100)
     ax_e = fig_e.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
     ax_e.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
@@ -552,16 +551,13 @@ def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
         sq_devs = (stack - super_m)**2
         total_sq = np.sum(sq_devs, axis=0) + 1e-5
         var_shares = sq_devs / total_sq
-
-        mask_active = spr_inter >= 15.0  # Minimum 15m inter-model spread
+        mask_active = spr_inter >= 15.0
         
         for idx, k in enumerate(keys):
             other_indices = [j for j in range(4) if j != idx]
             trio_mean = np.mean(stack[other_indices], axis=0)
             delta_3v1 = stack[idx] - trio_mean
             abs_delta = np.abs(delta_3v1)
-            
-            # Isolated outlier: >=60% variance share AND departure >= 25m
             is_rogue = mask_active & (var_shares[idx] >= 0.60) & (abs_delta >= 25.0)
             
             if np.any(is_rogue):
@@ -595,148 +591,129 @@ def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
 
 
 # ==============================================================================
-# 7. BATCH PRODUCTION LOOP (CURRENT CYCLE)
+# 7. BATCH PRODUCTION LOOP (ONLY EXECUTED IF RUN IS NOT ALREADY CACHED)
 # ==============================================================================
-for fxx in FXX_STEPS:
-    valid_time = date_dt + timedelta(hours=fxx)
-    print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
-    
-    # 1. Fetch ensembles
-    gefs_mems   = fetch_gefs_lead(fxx)
-    aigefs_mems = fetch_aigefs_ensemble(fxx)
-    ifs_mems    = fetch_ifs_ensemble(fxx)
-    aifs_mems   = fetch_aifs_ensemble(fxx)
+if not skip_download_and_generation:
+    for fxx in FXX_STEPS:
+        valid_time = date_dt + timedelta(hours=fxx)
+        print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
+        
+        # 1. Fetch ensembles
+        gefs_mems   = fetch_gefs_lead(fxx)
+        aigefs_mems = fetch_aigefs_ensemble(fxx)
+        ifs_mems    = fetch_ifs_ensemble(fxx)
+        aifs_mems   = fetch_aifs_ensemble(fxx)
 
-    print(f"  ↳ Members loaded: GEFS={len(gefs_mems)}, AIGEFS={len(aigefs_mems)}, IFS={len(ifs_mems)}, AIFS={len(aifs_mems)}")
+        print(f"  ↳ Members loaded: GEFS={len(gefs_mems)}, AIGEFS={len(aigefs_mems)}, IFS={len(ifs_mems)}, AIFS={len(aifs_mems)}")
 
-    # 2. Compute means
-    gefs_mean   = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
-    aigefs_mean = np.mean(np.stack(aigefs_mems), axis=0) if aigefs_mems else None
-    ifs_mean    = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
-    aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
-    
-    all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
-    super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
+        # 2. Compute means
+        gefs_mean   = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
+        aigefs_mean = np.mean(np.stack(aigefs_mems), axis=0) if aigefs_mems else None
+        ifs_mean    = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
+        aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
+        
+        all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
+        super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # 3. Fetch deterministics
-    det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
-    det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
-    det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
-    det_aigfs = fetch_aigfs(fxx)
+        # 3. Fetch deterministics
+        det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
+        det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
+        det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
+        det_aigfs = fetch_aigfs(fxx)
 
-    # 4. Spread Diagnostics
-    spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
+        # 4. Spread Diagnostics
+        spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-    # 5. Save compact 2D grids for trend / archive calculations
-    if super_mean is not None and spread_diags['inter'] is not None:
-        np.savez_compressed(
-            os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
-            super_mean=super_mean.astype(np.float32),
-            spr_inter=spread_diags['inter'].astype(np.float32)
+        # 5. Save compact 2D grids for trend / archive calculations
+        if super_mean is not None and spread_diags['inter'] is not None:
+            np.savez_compressed(
+                os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
+                super_mean=super_mean.astype(np.float32),
+                spr_inter=spread_diags['inter'].astype(np.float32)
+            )
+
+        # 6. Outlier Underlays
+        det_dict = {'gfs': det_gfs, 'aigfs': det_aigfs, 'ecmwf': det_ifs, 'aifs': det_aifs}
+        render_deterministic_outliers(det_dict, super_mean, spread_diags.get('total'), f"outlier_det_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+
+        means_dict = {'gefs': gefs_mean, 'aigefs': aigefs_mean, 'ifs': ifs_mean, 'aifs': aifs_mean}
+        render_ensemble_lone_wolf(means_dict, spread_diags.get('inter'), f"outlier_ens_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+
+        # 7. Physics vs AI Difference Underlay
+        phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
+        ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
+        physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0) if phys_cluster and ai_cluster else None
+        render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+
+        # 8. Standard Spread Underlays
+        for spr_key, spr_grid in spread_diags.items():
+            render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+
+        # 9. Multi-Run Trend Diagnostics
+        prior_cycles = sorted(
+            [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
+            reverse=True
         )
 
-    # 6. Outlier Underlays
-    # A. Deterministic Outliers (|Z| >= 2.0σ relative to superensemble spread)
-    det_dict = {
-        'gfs': det_gfs,
-        'aigfs': det_aigfs,
-        'ecmwf': det_ifs,
-        'aifs': det_aifs
-    }
-    render_deterministic_outliers(det_dict, super_mean, spread_diags.get('total'), f"outlier_det_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+        past_means = [super_mean] if super_mean is not None else []
+        past_spr_inters = [spread_diags['inter']] if spread_diags['inter'] is not None else []
 
-    # B. Ensemble Mean 'Lone Wolf' Outliers (3-vs-1 Consensus Isolation)
-    means_dict = {
-        'gefs': gefs_mean,
-        'aigefs': aigefs_mean,
-        'ifs': ifs_mean,
-        'aifs': aifs_mean
-    }
-    render_ensemble_lone_wolf(means_dict, spread_diags.get('inter'), f"outlier_ens_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+        for past_id in prior_cycles[:3]:
+            try:
+                past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
+                past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
+                if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
+                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    if os.path.exists(past_npz_path):
+                        with np.load(past_npz_path) as data:
+                            past_means.append(data['super_mean'])
+                            past_spr_inters.append(data['spr_inter'])
+            except Exception:
+                pass
 
-    # 7. Physics vs AI Difference Underlay
-    phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
-    ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
-    if phys_cluster and ai_cluster:
-        physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0)
-    else:
-        physics_vs_ai_diff = None
-    render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+        delta_spr_inter = past_spr_inters[0] - past_spr_inters[1] if len(past_spr_inters) >= 2 else None
+        render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
-    # 8. Standard Spread Underlays
-    for spr_key, spr_grid in spread_diags.items():
-        render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+        if len(past_means) >= 2:
+            increments = [past_means[i] - past_means[i+1] for i in range(len(past_means) - 1)]
+            delta_net = past_means[0] - past_means[-1]
+            path_length = np.sum([np.abs(inc) for inc in increments], axis=0)
+            mono_ratio = delta_net / (path_length + 1e-5)
+            monotonic_trend = delta_net * np.abs(mono_ratio)
+            flip_flop_energy = path_length - np.abs(delta_net)
+        else:
+            monotonic_trend = None
+            flip_flop_energy = None
 
-    # 9. Multi-Run Trend Diagnostics (Convergence, Monotonic Trend, Flip-Flop)
-    prior_cycles = sorted(
-        [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
-        reverse=True
-    )
+        render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+        render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-    past_means = [super_mean] if super_mean is not None else []
-    past_spr_inters = [spread_diags['inter']] if spread_diags['inter'] is not None else []
+        # 10. Extract vector contours
+        super_contours = extract_contours(super_mean)
+        print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
-    for past_id in prior_cycles[:3]:
-        try:
-            past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
-            past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
-            if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
-                if os.path.exists(past_npz_path):
-                    with np.load(past_npz_path) as data:
-                        past_means.append(data['super_mean'])
-                        past_spr_inters.append(data['spr_inter'])
-        except Exception:
-            pass
+        step_data = {
+            "fxx": fxx,
+            "init": global_init_time,
+            "valid": valid_time.strftime('%Y-%m-%d %H:%MZ'),
+            "super_mean": super_contours,
+            "gefs_mean": extract_contours(gefs_mean),
+            "aigefs_mean": extract_contours(aigefs_mean),
+            "ifs_mean": extract_contours(ifs_mean),
+            "aifs_mean": extract_contours(aifs_mean),
+            "gfs_det": extract_contours(det_gfs),
+            "aigfs_det": extract_contours(det_aigfs),
+            "ecmwf_det": extract_contours(det_ifs),
+            "aifs_det": extract_contours(det_aifs),
+            "gefs_members": [extract_contours(m) for m in gefs_mems],
+            "aigefs_members": [extract_contours(m) for m in aigefs_mems],
+            "ifs_members": [extract_contours(m) for m in ifs_mems],
+            "aifs_members": [extract_contours(m) for m in aifs_mems]
+        }
 
-    # A. Convergence Rate (Δσ_inter vs run -12h)
-    if len(past_spr_inters) >= 2:
-        delta_spr_inter = past_spr_inters[0] - past_spr_inters[1]
-    else:
-        delta_spr_inter = None
-    render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
-
-    # B. 4-Run Monotonic Trend & Flip-Flop Volatility
-    if len(past_means) >= 2:
-        increments = [past_means[i] - past_means[i+1] for i in range(len(past_means) - 1)]
-        delta_net = past_means[0] - past_means[-1]
-        path_length = np.sum([np.abs(inc) for inc in increments], axis=0)
-        mono_ratio = delta_net / (path_length + 1e-5)
-        monotonic_trend = delta_net * np.abs(mono_ratio)
-        flip_flop_energy = path_length - np.abs(delta_net)
-    else:
-        monotonic_trend = None
-        flip_flop_energy = None
-
-    render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
-    render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
-
-    # 10. Extract vector contours
-    super_contours = extract_contours(super_mean)
-    print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
-
-    step_data = {
-        "fxx": fxx,
-        "init": global_init_time,
-        "valid": valid_time.strftime('%Y-%m-%d %H:%MZ'),
-        "super_mean": super_contours,
-        "gefs_mean": extract_contours(gefs_mean),
-        "aigefs_mean": extract_contours(aigefs_mean),
-        "ifs_mean": extract_contours(ifs_mean),
-        "aifs_mean": extract_contours(aifs_mean),
-        "gfs_det": extract_contours(det_gfs),
-        "aigfs_det": extract_contours(det_aigfs),
-        "ecmwf_det": extract_contours(det_ifs),
-        "aifs_det": extract_contours(det_aifs),
-        "gefs_members": [extract_contours(m) for m in gefs_mems],
-        "aigefs_members": [extract_contours(m) for m in aigefs_mems],
-        "ifs_members": [extract_contours(m) for m in ifs_mems],
-        "aifs_members": [extract_contours(m) for m in aifs_mems]
-    }
-
-    json_path = os.path.join(CURRENT_DATA_DIR, f"f{fxx:03d}.json")
-    with open(json_path, "w") as f:
-        json.dump(step_data, f, separators=(',', ':'))
+        json_path = os.path.join(CURRENT_DATA_DIR, f"f{fxx:03d}.json")
+        with open(json_path, "w") as f:
+            json.dump(step_data, f, separators=(',', ':'))
 
 plt.close(fig)
 
@@ -779,7 +756,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (WITH OUTLIER UNDERLAYS INCLUDED)
+# 9. GENERATE DYNAMIC HTML FRONTEND (REORGANIZED UNDERLAYS + TOOLTIPS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -824,6 +801,12 @@ html_content = f"""<!DOCTYPE html>
     select {{
       padding: 5px 8px; border-radius: 6px; background: #0f172a; color: white;
       border: 1px solid var(--border); font-size: 12px; cursor: pointer;
+    }}
+    optgroup {{
+      background: #1e293b; color: #94a3b8; font-weight: bold; font-style: normal;
+    }}
+    option {{
+      background: #0f172a; color: #f8fafc; font-weight: normal;
     }}
 
     .model-group-row {{
@@ -877,6 +860,37 @@ html_content = f"""<!DOCTYPE html>
       width: 120px; height: 11px; border-radius: 3px; border: 1px solid var(--border);
     }}
 
+    /* Underlay Tooltip Styles */
+    .tooltip-container {{
+      position: relative; display: inline-flex; align-items: center;
+    }}
+    .info-btn {{
+      background: #334155; color: #93c5fd; border: none; width: 22px; height: 22px;
+      border-radius: 50%; font-size: 12px; font-weight: bold; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; transition: 0.15s;
+    }}
+    .info-btn:hover {{
+      background: #475569; color: #ffffff;
+    }}
+    .tooltip-card {{
+      display: none; position: absolute; top: 30px; right: 0; width: 320px;
+      background: #0f172a; border: 1px solid #475569; border-radius: 8px;
+      padding: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); z-index: 100;
+      color: #e2e8f0; font-size: 12px; line-height: 1.4;
+    }}
+    .tooltip-card.show {{
+      display: block;
+    }}
+    .tooltip-title {{
+      font-weight: bold; font-size: 13px; color: #60a5fa; margin-bottom: 6px;
+      border-bottom: 1px solid #334155; padding-bottom: 4px;
+    }}
+    .tooltip-section {{ margin-top: 6px; }}
+    .tooltip-section b {{ color: #cbd5e1; }}
+    .underlay-desc-bar {{
+      font-size: 11.5px; color: #94a3b8; font-style: italic; margin-top: -4px;
+    }}
+
     .footer {{ margin: 12px 0 25px 0; font-size: 12px; color: var(--text-muted); }}
     kbd {{ background: #334155; padding: 2px 5px; border-radius: 4px; font-size: 11px; }}
   </style>
@@ -906,24 +920,44 @@ html_content = f"""<!DOCTYPE html>
         <span id="dprogStatus" style="color: #cbd5e1; font-size: 11px; margin-left: 4px;"></span>
       </div>
 
+      <!-- Reorganized Underlay Selection with Tooltip -->
       <div style="display: flex; gap: 8px; align-items: center;">
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
-          <option value="none">Basemap Only</option>
-          <option value="outlier_ens">Ensemble Mean Outliers (3-vs-1 Isolation)</option>
-          <option value="outlier_det">Deterministic Outliers (|Z| ≥ 2.0σ)</option>
-          <option value="monotonic_trend">4-Run Consistent Trend (Deepening vs Building)</option>
-          <option value="flipflop">4-Run Flip-Flop Volatility (Oscillation Energy)</option>
-          <option value="convergence">Model Convergence Rate (Δσ_inter: Green=Agree, Purple=Dis)</option>
-          <option value="physics_vs_ai">Physics minus AI (Phys - AI)</option>
-          <option value="inter">Inter-Model Disagreement (σ_inter)</option>
-          <option value="total">Total Super Spread (σ_total)</option>
-          <option value="intra_pooled">Pooled Internal Chaos (σ_intra)</option>
-          <option value="gefs">GEFS Spread</option>
-          <option value="aigefs">AIGEFS Spread</option>
-          <option value="ifs">ECMWF IFS Spread</option>
-          <option value="aifs">AIFS Spread</option>
+          <optgroup label="Standard Basemap">
+            <option value="none">Basemap Only (Clean)</option>
+          </optgroup>
+          <optgroup label="Consensus & Outliers">
+            <option value="outlier_ens">Ensemble Mean Outliers (3-vs-1)</option>
+            <option value="outlier_det">Deterministic Outliers (|Z| ≥ 2.0σ)</option>
+            <option value="inter">Inter-Model Disagreement (σ_inter)</option>
+            <option value="physics_vs_ai">Physics minus AI (Phys - AI)</option>
+          </optgroup>
+          <optgroup label="Multi-Run Trends (dprog/dt)">
+            <option value="monotonic_trend">4-Run Monotonic Trend (Deep vs Build)</option>
+            <option value="flipflop">4-Run Flip-Flop Volatility (Oscillation)</option>
+            <option value="convergence">Model Convergence Rate (Δσ_inter)</option>
+          </optgroup>
+          <optgroup label="Ensemble Spread & Chaos">
+            <option value="total">Total Super Spread (σ_total)</option>
+            <option value="intra_pooled">Pooled Internal Chaos (σ_intra)</option>
+            <option value="gefs">GEFS Spread</option>
+            <option value="aigefs">AIGEFS Spread</option>
+            <option value="ifs">ECMWF IFS Spread</option>
+            <option value="aifs">AIFS Spread</option>
+          </optgroup>
         </select>
+
+        <!-- Tooltip Trigger Button -->
+        <div class="tooltip-container">
+          <button class="info-btn" id="infoBtn" onclick="toggleTooltip(event)" title="Click to view explanation of this underlay">ℹ</button>
+          <div class="tooltip-card" id="tooltipCard">
+            <div class="tooltip-title" id="ttTitle">Diagnostic Info</div>
+            <div id="ttDesc">Description</div>
+            <div class="tooltip-section"><b>Color Guide:</b> <span id="ttColors">Colors</span></div>
+            <div class="tooltip-section"><b>Desk Action:</b> <span id="ttAction">Action</span></div>
+          </div>
+        </div>
 
         <div class="spread-colorbar" id="cbarBox">
           <span id="cbarMin">10m</span>
@@ -931,6 +965,11 @@ html_content = f"""<!DOCTYPE html>
           <span id="cbarMax">120m+</span>
         </div>
       </div>
+    </div>
+
+    <!-- Inline 1-Line Underlay Summary -->
+    <div class="underlay-desc-bar" id="underlayDescBar">
+      Clean basemap with interactive vector contours on top.
     </div>
 
     <!-- Row 2: Lead Scrubbing & Display Mode -->
@@ -1023,6 +1062,121 @@ html_content = f"""<!DOCTYPE html>
     let currentStepData = null;
     let manifestData = {{ runs: [] }};
 
+    // Dictionary of Meteorological Explanations for Tooltip
+    const UNDERLAY_INFO = {{
+      'none': {{
+        title: 'Basemap Only (Clean)',
+        desc: 'Standard Lambert Conformal basemap with state and coastline features. Leaves the canvas clean for spaghetti contour analysis.',
+        colors: 'Neutral terrain styling.',
+        action: 'Ideal for unencumbered inspection of tight contour clusters or manual wave tracking.',
+        summary: 'Clean basemap with interactive vector contours on top.'
+      }},
+      'outlier_ens': {{
+        title: 'Ensemble Mean Outliers (3-vs-1 Isolation)',
+        desc: 'Flags when a single ensemble mean breaks away from the other three systems, accounting for ≥60% of total inter-model variance with a departure of ≥25m.',
+        colors: 'Shaded by the rogue model color: Blue (GEFS), Purple (AIGEFS), Red (IFS), Green (AIFS).',
+        action: 'Treat the flagged model with skepticism if the other 3 agree. If blank, models are either clustered or locked in a 2-vs-2 split.',
+        summary: 'Highlights lone-wolf ensemble means that deviate sharply from the other 3 systems.'
+      }},
+      'outlier_det': {{
+        title: 'Deterministic Outliers (|Z| ≥ 2.0σ)',
+        desc: 'Identifies operational deterministic runs that sit in the extreme tails (≥2 standard deviations) relative to the 164-member superensemble spread.',
+        colors: 'Dominant outlier gets solid color fill (Navy: GFS, Purple: AIGFS, Red: IFS, Green: AIFS). Dashed contours indicate co-outliers.',
+        action: 'Avoid anchoring your forecast to a single deterministic run when it is flagged as an outlier.',
+        summary: 'Highlights operational deterministic runs falling outside the 164-member ensemble envelope.'
+      }},
+      'inter': {{
+        title: 'Inter-Model Disagreement (σ_inter)',
+        desc: 'Standard deviation between the 4 ensemble means (GEFS, AIGEFS, IFS, AIFS). Isolates structural synoptic differences between modeling centers.',
+        colors: 'Yellow to Dark Red (10m to 120m+ spread among ensemble means).',
+        action: 'High values flag a "Model War" or synoptic bifurcation. Do not blend or trust the Super Mean here.',
+        summary: 'Measures disagreement among the 4 ensemble means. High bullseyes indicate a Model War.'
+      }},
+      'physics_vs_ai': {{
+        title: 'Physics minus AI (Phys - AI)',
+        desc: 'Difference between the pooled traditional physics mean (GEFS + IFS) and the pooled AI emulator mean (AIGEFS + AIFS).',
+        colors: 'Red (+10 to +80m): Physics higher / AI deeper. Blue (-10 to -80m): AI higher / Physics deeper.',
+        action: 'Reveals whether differences are driven by AI smoothing of PV anomalies or physics convective feedbacks.',
+        summary: 'Compares Physics ensembles (GEFS+IFS) against Deep-Learning AI ensembles (AIGEFS+AIFS).'
+      }},
+      'monotonic_trend': {{
+        title: '4-Run Monotonic Trend (Deepening vs Building)',
+        desc: 'Measures persistent, directional height changes across the last 4 consecutive runs (0h, -12h, -24h, -36h) for this identical valid time.',
+        colors: 'Blue (-20 to -80m): Steady multi-run deepening trough. Red (+20 to +80m): Steady multi-run building ridge.',
+        action: 'Confirms a genuine synoptic trend across shifts rather than single-run model noise.',
+        summary: 'Shows where models have consistently trended deeper (blue) or stronger (red) over 4 cycles.'
+      }},
+      'flipflop': {{
+        title: '4-Run Flip-Flop Volatility (Oscillation Energy)',
+        desc: 'Calculates path-length hunting: identifies regions where guidance has bounced back and forth across consecutive shifts without settling on a solution.',
+        colors: 'Yellow to Red (10m to 80m+ of oscillating volatility).',
+        action: 'Do not chase the latest run inside a bright bullseye; guidance is unstable.',
+        summary: 'Warns of "washing machine" zones where models are alternating between deeper and weaker.'
+      }},
+      'convergence': {{
+        title: 'Model Convergence Rate (Δσ_inter)',
+        desc: 'Compares inter-model disagreement now versus 12 hours ago for this valid time.',
+        colors: 'Green (-30m): Models converging into consensus. Purple (+30m): Models diverging further apart.',
+        action: 'Green indicates growing confidence. Purple flags an emerging synoptic bifurcation.',
+        summary: 'Green shows models locking onto consensus; Purple flags an emerging model war.'
+      }},
+      'total': {{
+        title: 'Total Superensemble Spread (σ_total)',
+        desc: 'Standard deviation across all 164 individual ensemble members pooled together. Measures the total atmospheric uncertainty envelope.',
+        colors: 'Yellow to Dark Red (10m to 120m+ spread across all members).',
+        action: 'Represents the big-picture confidence boundary for synoptic feature placement.',
+        summary: 'Overall uncertainty envelope across all 164 members pooled together.'
+      }},
+      'intra_pooled': {{
+        title: 'Pooled Internal Chaos (σ_intra)',
+        desc: 'Average standard deviation occurring internally inside each ensemble system. Measures sensitivity to initial conditions and chaotic dispersion.',
+        colors: 'Yellow to Dark Red (10m to 120m+ internal chaotic spread).',
+        action: 'High values mean internal wave timing or shortwave dispersion is chaotic.',
+        summary: 'Average chaotic disagreement within each individual ensemble system.'
+      }},
+      'gefs': {{
+        title: 'GEFS Spread',
+        desc: 'Internal standard deviation among the 31 physics-based GEFS members.',
+        colors: 'Yellow to Dark Red.',
+        action: 'Evaluates NCEP physics suite sensitivity.',
+        summary: 'Internal spread among the 31 NCEP GEFS members.'
+      }},
+      'aigefs': {{
+        title: 'AIGEFS Spread',
+        desc: 'Internal standard deviation among the 31 NOAA AI-GEFS members.',
+        colors: 'Yellow to Dark Red.',
+        action: 'Evaluates NCEP AI suite dispersion.',
+        summary: 'Internal spread among the 31 NOAA AIGEFS deep-learning members.'
+      }},
+      'ifs': {{
+        title: 'ECMWF IFS Spread',
+        desc: 'Internal standard deviation among the 51 ECMWF IFS members.',
+        colors: 'Yellow to Dark Red.',
+        action: 'Evaluates European physics suite dispersion.',
+        summary: 'Internal spread among the 51 ECMWF IFS members.'
+      }},
+      'aifs': {{
+        title: 'AIFS Spread',
+        desc: 'Internal standard deviation among the 51 ECMWF AIFS members.',
+        colors: 'Yellow to Dark Red.',
+        action: 'Evaluates European AI suite dispersion.',
+        summary: 'Internal spread among the 51 ECMWF AIFS deep-learning members.'
+      }}
+    }};
+
+    function toggleTooltip(e) {{
+      e.stopPropagation();
+      const card = document.getElementById('tooltipCard');
+      card.classList.toggle('show');
+    }}
+
+    document.addEventListener('click', (e) => {{
+      const container = document.querySelector('.tooltip-container');
+      if (container && !container.contains(e.target)) {{
+        document.getElementById('tooltipCard').classList.remove('show');
+      }}
+    }});
+
     function parseUtcDate(str) {{
       if (!str) return NaN;
       const clean = str.replace(/[Zz]/g, '').trim();
@@ -1112,6 +1266,14 @@ html_content = f"""<!DOCTYPE html>
       const cbarGrad = document.getElementById('cbarGrad');
       const cbarMin = document.getElementById('cbarMin');
       const cbarMax = document.getElementById('cbarMax');
+
+      // Update Tooltip and Summary Text
+      const info = UNDERLAY_INFO[bg] || UNDERLAY_INFO['none'];
+      document.getElementById('ttTitle').textContent = info.title;
+      document.getElementById('ttDesc').textContent = info.desc;
+      document.getElementById('ttColors').textContent = info.colors;
+      document.getElementById('ttAction').textContent = info.action;
+      document.getElementById('underlayDescBar').textContent = info.summary;
 
       img.onerror = function() {{
         img.onerror = null;
