@@ -373,6 +373,32 @@ CONV_NORM = mcolors.TwoSlopeNorm(vmin=-30, vcenter=0, vmax=30)
 FLIP_LEVELS = np.arange(10, 90, 10)
 FLIP_CMAP = plt.cm.YlOrRd
 
+DET_OUTLIER_PALETTES = {
+    'gfs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],      # GFS Det (Blue)
+    'aigfs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],    # AIGFS Det (Purple)
+    'ecmwf': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],    # IFS Det (Red)
+    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']      # AIFS Det (Green)
+}
+DET_OUTLIER_COLORS = {
+    'gfs': '#001155',
+    'aigfs': '#4a235a',
+    'ecmwf': '#78281f',
+    'aifs': '#145a32'
+}
+
+ENS_OUTLIER_PALETTES = {
+    'gefs': ['#90caf9', '#42a5f5', '#1e88e5', '#0d47a1'],      # GEFS (Blue)
+    'aigefs': ['#e1bee7', '#ba68c8', '#8e24aa', '#4a148c'],    # AIGEFS (Purple)
+    'ifs': ['#ffcdd2', '#e57373', '#e53935', '#b71c1c'],       # IFS (Red)
+    'aifs': ['#c8e6c9', '#81c784', '#43a047', '#1b5e20']       # AIFS (Green)
+}
+ENS_OUTLIER_COLORS = {
+    'gefs': '#0044ff',
+    'aigefs': '#8e44ad',
+    'ifs': '#d63031',
+    'aifs': '#00b894'
+}
+
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
         if len(mem_list) > 1:
@@ -442,6 +468,131 @@ def render_contourf_underlay(grid, levels, cmap, norm, filename, target_dir, ext
     fig_u.savefig(os.path.join(target_dir, filename), dpi=100)
     plt.close(fig_u)
 
+def render_deterministic_outliers(det_dict, super_mean, spr_total, filename, target_dir):
+    """
+    Renders standardized departure outliers (|Z| >= 2.0).
+    Dominant outlier gets shaded color fill; co-outliers get colored boundary contour lines.
+    """
+    fig_o = plt.figure(figsize=(12, 8), dpi=100)
+    ax_o = fig_o.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
+    ax_o.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    ax_o.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax_o.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
+
+    valid_models = {k: v for k, v in det_dict.items() if v is not None}
+    if super_mean is not None and spr_total is not None and valid_models:
+        eps = 2.0
+        z_dict = {k: (v - super_mean) / (spr_total + eps) for k, v in valid_models.items()}
+        abs_z_dict = {k: np.abs(z) for k, z in z_dict.items()}
+        
+        model_keys = list(abs_z_dict.keys())
+        abs_stack = np.stack([abs_z_dict[k] for k in model_keys], axis=0)
+        dom_idx = np.argmax(abs_stack, axis=0)
+        max_abs_z = np.max(abs_stack, axis=0)
+        
+        # 1. Fill dominant outlier where |Z| >= 2.0
+        for i, k in enumerate(model_keys):
+            mask_dom = (dom_idx == i) & (max_abs_z >= 2.0)
+            if np.any(mask_dom):
+                z_dom = np.where(mask_dom, max_abs_z, np.nan)
+                palette = DET_OUTLIER_PALETTES.get(k, ['#fed976', '#feb24c', '#fd8d3c', '#f03b20'])
+                try:
+                    ax_o.contourf(
+                        target_lons, target_lats, z_dom,
+                        levels=[2.0, 2.5, 3.0, 4.0],
+                        colors=palette,
+                        transform=ccrs.PlateCarree(),
+                        extend='max', alpha=0.85
+                    )
+                except Exception:
+                    pass
+
+        # 2. Draw contour boundaries for ALL models breaching 2.0 (reveals co-outliers)
+        for k, abs_z in abs_z_dict.items():
+            if np.any(abs_z >= 2.0):
+                line_color = DET_OUTLIER_COLORS.get(k, '#000000')
+                try:
+                    ax_o.contour(
+                        target_lons, target_lats, abs_z,
+                        levels=[2.0],
+                        colors=[line_color],
+                        linewidths=1.8,
+                        linestyles='--',
+                        transform=ccrs.PlateCarree()
+                    )
+                except Exception:
+                    pass
+
+    ax_o.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
+    ax_o.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
+    ax_o.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
+    ax_o.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
+
+    fig_o.savefig(os.path.join(target_dir, filename), dpi=100)
+    plt.close(fig_o)
+
+def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
+    """
+    Renders ensemble mean 'lone wolf' outliers where one ensemble mean deviates
+    significantly from the consensus of the other 3 (3-vs-1 isolation).
+    """
+    fig_e = plt.figure(figsize=(12, 8), dpi=100)
+    ax_e = fig_e.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
+    ax_e.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    ax_e.add_feature(cfeature.LAND, facecolor="#f8f9fa")
+    ax_e.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
+
+    keys = ['gefs', 'aigefs', 'ifs', 'aifs']
+    if all(means_dict.get(k) is not None for k in keys) and spr_inter is not None:
+        stack = np.stack([means_dict[k] for k in keys], axis=0)
+        super_m = np.mean(stack, axis=0)
+        
+        sq_devs = (stack - super_m)**2
+        total_sq = np.sum(sq_devs, axis=0) + 1e-5
+        var_shares = sq_devs / total_sq
+
+        mask_active = spr_inter >= 15.0  # Minimum 15m inter-model spread
+        
+        for idx, k in enumerate(keys):
+            other_indices = [j for j in range(4) if j != idx]
+            trio_mean = np.mean(stack[other_indices], axis=0)
+            delta_3v1 = stack[idx] - trio_mean
+            abs_delta = np.abs(delta_3v1)
+            
+            # Isolated outlier: >=60% variance share AND departure >= 25m
+            is_rogue = mask_active & (var_shares[idx] >= 0.60) & (abs_delta >= 25.0)
+            
+            if np.any(is_rogue):
+                grid_rogue = np.where(is_rogue, abs_delta, np.nan)
+                palette = ENS_OUTLIER_PALETTES.get(k, ['#fed976', '#feb24c', '#fd8d3c', '#f03b20'])
+                try:
+                    ax_e.contourf(
+                        target_lons, target_lats, grid_rogue,
+                        levels=[25.0, 35.0, 50.0, 75.0],
+                        colors=palette,
+                        transform=ccrs.PlateCarree(),
+                        extend='max', alpha=0.85
+                    )
+                    ax_e.contour(
+                        target_lons, target_lats, abs_delta,
+                        levels=[25.0],
+                        colors=[ENS_OUTLIER_COLORS.get(k, '#000000')],
+                        linewidths=1.8,
+                        transform=ccrs.PlateCarree()
+                    )
+                except Exception:
+                    pass
+
+    ax_e.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
+    ax_e.add_feature(cfeature.BORDERS, linewidth=0.9, edgecolor="#333333")
+    ax_e.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#666666", linestyle=":")
+    ax_e.add_feature(cfeature.LAKES, facecolor="#eef2f5", edgecolor="#666666", linewidth=0.4)
+
+    fig_e.savefig(os.path.join(target_dir, filename), dpi=100)
+    plt.close(fig_e)
+
 
 # ==============================================================================
 # 7. BATCH PRODUCTION LOOP (CURRENT CYCLE)
@@ -467,10 +618,16 @@ for fxx in FXX_STEPS:
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # 3. Spread Diagnostics
+    # 3. Fetch deterministics
+    det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
+    det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
+    det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
+    det_aigfs = fetch_aigfs(fxx)
+
+    # 4. Spread Diagnostics
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-    # 4. Save compact 2D grids for trend / archive calculations
+    # 5. Save compact 2D grids for trend / archive calculations
     if super_mean is not None and spread_diags['inter'] is not None:
         np.savez_compressed(
             os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
@@ -478,7 +635,26 @@ for fxx in FXX_STEPS:
             spr_inter=spread_diags['inter'].astype(np.float32)
         )
 
-    # 5. Physics vs AI Difference Underlay
+    # 6. Outlier Underlays
+    # A. Deterministic Outliers (|Z| >= 2.0σ relative to superensemble spread)
+    det_dict = {
+        'gfs': det_gfs,
+        'aigfs': det_aigfs,
+        'ecmwf': det_ifs,
+        'aifs': det_aifs
+    }
+    render_deterministic_outliers(det_dict, super_mean, spread_diags.get('total'), f"outlier_det_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+
+    # B. Ensemble Mean 'Lone Wolf' Outliers (3-vs-1 Consensus Isolation)
+    means_dict = {
+        'gefs': gefs_mean,
+        'aigefs': aigefs_mean,
+        'ifs': ifs_mean,
+        'aifs': aifs_mean
+    }
+    render_ensemble_lone_wolf(means_dict, spread_diags.get('inter'), f"outlier_ens_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
+
+    # 7. Physics vs AI Difference Underlay
     phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
     ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
     if phys_cluster and ai_cluster:
@@ -487,12 +663,11 @@ for fxx in FXX_STEPS:
         physics_vs_ai_diff = None
     render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
-    # 6. Standard Spread Underlays
+    # 8. Standard Spread Underlays
     for spr_key, spr_grid in spread_diags.items():
         render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-    # 7. Multi-Run Trend Diagnostics (Convergence, Monotonic Trend, Flip-Flop)
-    # Search actual prior cycles present in RUNS_DIR
+    # 9. Multi-Run Trend Diagnostics (Convergence, Monotonic Trend, Flip-Flop)
     prior_cycles = sorted(
         [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
         reverse=True
@@ -518,7 +693,7 @@ for fxx in FXX_STEPS:
     if len(past_spr_inters) >= 2:
         delta_spr_inter = past_spr_inters[0] - past_spr_inters[1]
     else:
-        delta_spr_inter = None  # Neutral fallback basemap
+        delta_spr_inter = None
     render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
     # B. 4-Run Monotonic Trend & Flip-Flop Volatility
@@ -530,19 +705,13 @@ for fxx in FXX_STEPS:
         monotonic_trend = delta_net * np.abs(mono_ratio)
         flip_flop_energy = path_length - np.abs(delta_net)
     else:
-        monotonic_trend = None   # Neutral fallback basemap
-        flip_flop_energy = None  # Neutral fallback basemap
+        monotonic_trend = None
+        flip_flop_energy = None
 
     render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
     render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-    # 8. Deterministics
-    det_gfs   = fetch_deterministic("gfs", "pgrb2.0p25", ":HGT:500 mb:", fxx)
-    det_ifs   = fetch_deterministic("ifs", "oper", ":gh:500", fxx)
-    det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
-    det_aigfs = fetch_aigfs(fxx)
-
-    # 9. Extract vector contours
+    # 10. Extract vector contours
     super_contours = extract_contours(super_mean)
     print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
@@ -610,7 +779,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (FIXED GHOST PADDING & UNDERLAY ERROR FALLBACK)
+# 9. GENERATE DYNAMIC HTML FRONTEND (WITH OUTLIER UNDERLAYS INCLUDED)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -677,7 +846,6 @@ html_content = f"""<!DOCTYPE html>
     }}
     .chip.active {{ background: #2563eb; color: white; border-color: #3b82f6; font-weight: bold; }}
 
-    /* Updated viewer-card background to light land color so map never turns black */
     .viewer-card {{
       position: relative; width: 100%; max-width: 1200px; aspect-ratio: 1200 / 800;
       background: #f8f9fa; border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
@@ -742,6 +910,8 @@ html_content = f"""<!DOCTYPE html>
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
           <option value="none">Basemap Only</option>
+          <option value="outlier_ens">Ensemble Mean Outliers (3-vs-1 Isolation)</option>
+          <option value="outlier_det">Deterministic Outliers (|Z| ≥ 2.0σ)</option>
           <option value="monotonic_trend">4-Run Consistent Trend (Deepening vs Building)</option>
           <option value="flipflop">4-Run Flip-Flop Volatility (Oscillation Energy)</option>
           <option value="convergence">Model Convergence Rate (Δσ_inter: Green=Agree, Purple=Dis)</option>
@@ -933,7 +1103,6 @@ html_content = f"""<!DOCTYPE html>
       draw();
     }}
 
-    // Underlay Management with Auto-Fallback to Basemap
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
@@ -944,7 +1113,6 @@ html_content = f"""<!DOCTYPE html>
       const cbarMin = document.getElementById('cbarMin');
       const cbarMax = document.getElementById('cbarMax');
 
-      // Auto-fallback: If an underlay is missing, revert cleanly to basemap so map never goes black
       img.onerror = function() {{
         img.onerror = null;
         img.src = 'basemap.png';
@@ -954,6 +1122,18 @@ html_content = f"""<!DOCTYPE html>
       if (bg === 'none') {{
         img.src = 'basemap.png';
         cbar.style.display = 'none';
+      }} else if (bg === 'outlier_det') {{
+        img.src = `runs/${{runId}}/spread/outlier_det_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #001155 0% 25%, #4a235a 25% 50%, #78281f 50% 75%, #145a32 75% 100%)';
+        cbarMin.textContent = 'GFS/AIGFS';
+        cbarMax.textContent = 'IFS/AIFS (≥2σ)';
+      }} else if (bg === 'outlier_ens') {{
+        img.src = `runs/${{runId}}/spread/outlier_ens_f${{fxx}}.png`;
+        cbar.style.display = 'flex';
+        cbarGrad.style.background = 'linear-gradient(to right, #0044ff 0% 25%, #8e44ad 25% 50%, #d63031 50% 75%, #00b894 75% 100%)';
+        cbarMin.textContent = 'GEFS/AIGEFS';
+        cbarMax.textContent = 'IFS/AIFS (≥25m)';
       }} else if (bg === 'physics_vs_ai' || bg === 'monotonic_trend') {{
         img.src = `runs/${{runId}}/spread/${{bg}}_f${{fxx}}.png`;
         cbar.style.display = 'flex';
@@ -1184,7 +1364,6 @@ html_content = f"""<!DOCTYPE html>
               const pastFxx = Math.round((targetValidMs - pastInitMs) / 3600000);
 
               if (FXX_STEPS.includes(pastFxx)) {{
-                // Properly zero-pad lead time (e.g., f012, f024, f072)
                 const fxxStr = String(pastFxx).padStart(3, '0');
                 const pastCacheKey = `${{pastRunObj.id}}_${{fxxStr}}`;
                 
@@ -1229,6 +1408,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
+      // Dynamic Legend
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
