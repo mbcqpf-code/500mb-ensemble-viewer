@@ -111,12 +111,13 @@ os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
-# Idempotency Check: Check if all 21 JSON and PNG files already exist for this cycle
+# Idempotency Check
 skip_download_and_generation = False
 if os.path.exists(CURRENT_DATA_DIR) and os.path.exists(CURRENT_SPREAD_DIR):
-    all_json_exist = all(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json") and os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
-    all_png_exist = all(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png") and os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
-    if all_json_exist and all_png_exist:
+    all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
+    all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
+    metrics_exist = os.path.exists(os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json"))
+    if all_json_exist and all_png_exist and metrics_exist:
         skip_download_and_generation = True
         print(f"⚡ Cycle {current_cycle_id} already exists with complete 240h data!")
         print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
@@ -377,7 +378,7 @@ DIFF_CMAP = plt.cm.RdBu_r
 DIFF_NORM = mcolors.TwoSlopeNorm(vmin=-80, vcenter=0, vmax=80)
 
 CONV_LEVELS = np.arange(-30, 35, 5)
-CONV_CMAP = plt.cm.PRGn_r  # Green = Converging (<0), Purple = Diverging (>0)
+CONV_CMAP = plt.cm.PRGn_r
 CONV_NORM = mcolors.TwoSlopeNorm(vmin=-30, vcenter=0, vmax=30)
 
 FLIP_LEVELS = np.arange(10, 90, 10)
@@ -408,6 +409,21 @@ ENS_OUTLIER_COLORS = {
     'ifs': '#d63031',
     'aifs': '#00b894'
 }
+
+def compute_consensus_metrics(model_grid, super_mean):
+    """Computes centered spatial pattern correlation (r) and spatial RMS error (meters)."""
+    if model_grid is None or super_mean is None or np.all(np.isnan(model_grid)) or np.all(np.isnan(super_mean)):
+        return {"r": None, "rmsd": None}
+    try:
+        m_prime = model_grid - np.nanmean(model_grid)
+        s_prime = super_mean - np.nanmean(super_mean)
+        num = np.nansum(m_prime * s_prime)
+        denom = np.sqrt(np.nansum(m_prime**2) * np.nansum(s_prime**2)) + 1e-6
+        r_val = float(np.clip(num / denom, -1.0, 1.0))
+        rmsd_val = float(np.sqrt(np.nanmean((model_grid - super_mean)**2)))
+        return {"r": round(r_val, 3), "rmsd": round(rmsd_val, 1)}
+    except Exception:
+        return {"r": None, "rmsd": None}
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
@@ -593,9 +609,12 @@ def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
 # ==============================================================================
 # 7. BATCH PRODUCTION LOOP (ONLY EXECUTED IF RUN IS NOT ALREADY CACHED)
 # ==============================================================================
+all_run_metrics = {}
+
 if not skip_download_and_generation:
     for fxx in FXX_STEPS:
         valid_time = date_dt + timedelta(hours=fxx)
+        fxx_key = f"{fxx:03d}"
         print(f"\n📦 Processing Lead Time F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
         
         # 1. Fetch ensembles
@@ -621,10 +640,23 @@ if not skip_download_and_generation:
         det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
         det_aigfs = fetch_aigfs(fxx)
 
-        # 4. Spread Diagnostics
+        # 4. Consensus Metrics (Pattern correlation r and RMSD vs Super Mean)
+        step_metrics = {
+            "gefs_mean": compute_consensus_metrics(gefs_mean, super_mean),
+            "aigefs_mean": compute_consensus_metrics(aigefs_mean, super_mean),
+            "ifs_mean": compute_consensus_metrics(ifs_mean, super_mean),
+            "aifs_mean": compute_consensus_metrics(aifs_mean, super_mean),
+            "gfs_det": compute_consensus_metrics(det_gfs, super_mean),
+            "aigfs_det": compute_consensus_metrics(det_aigfs, super_mean),
+            "ecmwf_det": compute_consensus_metrics(det_ifs, super_mean),
+            "aifs_det": compute_consensus_metrics(det_aifs, super_mean)
+        }
+        all_run_metrics[fxx_key] = step_metrics
+
+        # 5. Spread Diagnostics
         spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-        # 5. Save compact 2D grids for trend / archive calculations
+        # 6. Save compact 2D grids for trend / archive calculations
         if super_mean is not None and spread_diags['inter'] is not None:
             np.savez_compressed(
                 os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
@@ -632,24 +664,24 @@ if not skip_download_and_generation:
                 spr_inter=spread_diags['inter'].astype(np.float32)
             )
 
-        # 6. Outlier Underlays
+        # 7. Outlier Underlays
         det_dict = {'gfs': det_gfs, 'aigfs': det_aigfs, 'ecmwf': det_ifs, 'aifs': det_aifs}
         render_deterministic_outliers(det_dict, super_mean, spread_diags.get('total'), f"outlier_det_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
 
         means_dict = {'gefs': gefs_mean, 'aigefs': aigefs_mean, 'ifs': ifs_mean, 'aifs': aifs_mean}
         render_ensemble_lone_wolf(means_dict, spread_diags.get('inter'), f"outlier_ens_f{fxx:03d}.png", CURRENT_SPREAD_DIR)
 
-        # 7. Physics vs AI Difference Underlay
+        # 8. Physics vs AI Difference Underlay
         phys_cluster = [m for m in [gefs_mean, ifs_mean] if m is not None]
         ai_cluster = [m for m in [aigefs_mean, aifs_mean] if m is not None]
         physics_vs_ai_diff = np.mean(np.stack(phys_cluster), axis=0) - np.mean(np.stack(ai_cluster), axis=0) if phys_cluster and ai_cluster else None
         render_contourf_underlay(physics_vs_ai_diff, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"physics_vs_ai_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
 
-        # 8. Standard Spread Underlays
+        # 9. Standard Spread Underlays
         for spr_key, spr_grid in spread_diags.items():
             render_contourf_underlay(spr_grid, SPREAD_LEVELS, SPREAD_CMAP, None, f"{spr_key}_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-        # 9. Multi-Run Trend Diagnostics
+        # 10. Multi-Run Trend Diagnostics
         prior_cycles = sorted(
             [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
             reverse=True
@@ -688,7 +720,7 @@ if not skip_download_and_generation:
         render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
         render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
 
-        # 10. Extract vector contours
+        # 11. Extract vector contours
         super_contours = extract_contours(super_mean)
         print(f"  ↳ Extracted {len(super_contours)} height levels for Superensemble Mean.")
 
@@ -696,6 +728,7 @@ if not skip_download_and_generation:
             "fxx": fxx,
             "init": global_init_time,
             "valid": valid_time.strftime('%Y-%m-%d %H:%MZ'),
+            "metrics": step_metrics,
             "super_mean": super_contours,
             "gefs_mean": extract_contours(gefs_mean),
             "aigefs_mean": extract_contours(aigefs_mean),
@@ -714,6 +747,12 @@ if not skip_download_and_generation:
         json_path = os.path.join(CURRENT_DATA_DIR, f"f{fxx:03d}.json")
         with open(json_path, "w") as f:
             json.dump(step_data, f, separators=(',', ':'))
+
+    # Save aggregated consensus metrics for full lead-time tracking
+    metrics_summary_path = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
+    with open(metrics_summary_path, "w") as f:
+        json.dump({"init": global_init_time, "metrics": all_run_metrics}, f, indent=2)
+    print(f"✅ Saved consensus_metrics.json for cycle {current_cycle_id}")
 
 plt.close(fig)
 
@@ -756,7 +795,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (REORGANIZED UNDERLAYS + TOOLTIPS)
+# 9. GENERATE DYNAMIC HTML FRONTEND (WITH MODAL CHART & LIVE CONSENSUS METRICS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -839,13 +878,13 @@ html_content = f"""<!DOCTYPE html>
     #contourCanvas {{ pointer-events: none; }}
     
     .legend-box {{
-      position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
+      position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.95);
       color: #111; padding: 6px 10px; border-radius: 6px; font-size: 11px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3px;
-      pointer-events: none; max-width: 260px;
+      pointer-events: none; max-width: 320px;
     }}
     .legend-line {{ display: flex; align-items: center; gap: 7px; }}
-    .line-sample {{ width: 20px; height: 3px; display: inline-block; }}
+    .line-sample {{ width: 20px; height: 3px; display: inline-block; flex-shrink: 0; }}
 
     .title-stamp {{
       position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.94);
@@ -860,7 +899,6 @@ html_content = f"""<!DOCTYPE html>
       width: 120px; height: 11px; border-radius: 3px; border: 1px solid var(--border);
     }}
 
-    /* Underlay Tooltip Styles */
     .tooltip-container {{
       position: relative; display: inline-flex; align-items: center;
     }}
@@ -889,6 +927,38 @@ html_content = f"""<!DOCTYPE html>
     .tooltip-section b {{ color: #cbd5e1; }}
     .underlay-desc-bar {{
       font-size: 11.5px; color: #94a3b8; font-style: italic; margin-top: -4px;
+    }}
+
+    /* Modal Overlay Styles for Consensus Tracker Chart */
+    .modal-overlay {{
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.75); z-index: 9999; justify-content: center; align-items: center;
+    }}
+    .modal-overlay.open {{ display: flex; }}
+    .modal-content {{
+      background: #1e293b; border: 1px solid var(--border); border-radius: 12px;
+      width: 90%; max-width: 920px; padding: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.7);
+      display: flex; flex-direction: column; gap: 14px; color: var(--text);
+    }}
+    .modal-header {{
+      display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }}
+    .modal-header h3 {{ margin: 0; font-size: 1.15rem; color: #60a5fa; }}
+    .modal-close {{
+      background: transparent; border: none; font-size: 24px; color: #94a3b8; cursor: pointer; line-height: 1;
+    }}
+    .modal-close:hover {{ color: #ffffff; }}
+    .modal-controls {{
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+      background: #0f172a; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border);
+    }}
+    .chart-wrapper {{
+      width: 100%; background: #0b1120; border-radius: 8px; border: 1px solid var(--border);
+      padding: 10px; box-sizing: border-box; display: flex; justify-content: center;
+    }}
+    .modal-legend {{
+      display: flex; flex-wrap: wrap; gap: 14px; font-size: 11.5px; justify-content: center; padding-top: 4px;
     }}
 
     .footer {{ margin: 12px 0 25px 0; font-size: 12px; color: var(--text-muted); }}
@@ -948,7 +1018,6 @@ html_content = f"""<!DOCTYPE html>
           </optgroup>
         </select>
 
-        <!-- Tooltip Trigger Button -->
         <div class="tooltip-container">
           <button class="info-btn" id="infoBtn" onclick="toggleTooltip(event)" title="Click to view explanation of this underlay">ℹ</button>
           <div class="tooltip-card" id="tooltipCard">
@@ -972,7 +1041,7 @@ html_content = f"""<!DOCTYPE html>
       Clean basemap with interactive vector contours on top.
     </div>
 
-    <!-- Row 2: Lead Scrubbing & Display Mode -->
+    <!-- Row 2: Lead Scrubbing, Display Mode, and Consensus Modal Trigger -->
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <b>Forecast Lead:</b>
@@ -987,6 +1056,10 @@ html_content = f"""<!DOCTYPE html>
         <b>Display Mode:</b>
         <label><input type="radio" name="displayMode" value="spaghetti" checked onchange="draw()"> Spaghetti + Means</label>
         <label><input type="radio" name="displayMode" value="means" onchange="draw()"> Means Only</label>
+      </div>
+
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button class="btn" style="background: #2563eb;" onclick="openConsensusModal()" title="View lead-time consensus tracking charts for all models">📈 Consensus Tracker</button>
       </div>
     </div>
 
@@ -1049,6 +1122,30 @@ html_content = f"""<!DOCTYPE html>
     <div class="legend-box" id="legendBox"></div>
   </div>
 
+  <!-- Consensus Tracker Modal Dialogue -->
+  <div id="consensusModal" class="modal-overlay" onclick="closeConsensusModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3>500 hPa Consensus Tracking (Model vs. Super Mean)</h3>
+        <button class="modal-close" onclick="closeConsensusModal()">&times;</button>
+      </div>
+      <div class="modal-controls">
+        <div style="display: flex; gap: 14px; align-items: center; font-size: 13px;">
+          <b>Metric:</b>
+          <label style="cursor: pointer;"><input type="radio" name="metricType" value="r" checked onchange="renderConsensusChart()"> Centered Pattern Correlation (r)</label>
+          <label style="cursor: pointer;"><input type="radio" name="metricType" value="rmsd" onchange="renderConsensusChart()"> Spatial RMS Difference (meters)</label>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted);">
+          Evaluates model wave phase alignment and amplitude bias against the 164-member Super Mean.
+        </div>
+      </div>
+      <div class="chart-wrapper">
+        <canvas id="consensusChart" width="850" height="380"></canvas>
+      </div>
+      <div class="modal-legend" id="modalLegend"></div>
+    </div>
+  </div>
+
   <div class="footer">
     Shortcuts: Use <kbd>←</kbd> and <kbd>→</kbd> for Forecast Leads | Use <kbd>↑</kbd> (Newer) and <kbd>↓</kbd> (Older) for Model Cycles.
   </div>
@@ -1059,10 +1156,10 @@ html_content = f"""<!DOCTYPE html>
     const FXX_STEPS = {FXX_STEPS};
     let selectedContours = new Set(ALL_CONTOURS);
     let dataCache = {{}};
+    let consensusDataCache = {{}};
     let currentStepData = null;
     let manifestData = {{ runs: [] }};
 
-    // Dictionary of Meteorological Explanations for Tooltip
     const UNDERLAY_INFO = {{
       'none': {{
         title: 'Basemap Only (Clean)',
@@ -1267,7 +1364,6 @@ html_content = f"""<!DOCTYPE html>
       const cbarMin = document.getElementById('cbarMin');
       const cbarMax = document.getElementById('cbarMax');
 
-      // Update Tooltip and Summary Text
       const info = UNDERLAY_INFO[bg] || UNDERLAY_INFO['none'];
       document.getElementById('ttTitle').textContent = info.title;
       document.getElementById('ttDesc').textContent = info.desc;
@@ -1401,6 +1497,13 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }}
     }});
 
+    // Helper to format live consensus correlation & rmsd for legend
+    function formatConsensusMeta(m) {{
+      if (!m || m.r === null || m.r === undefined) return '';
+      const rStr = m.r >= 0 ? `r=${{m.r.toFixed(2)}}` : `r=${{m.r.toFixed(2)}}`;
+      return ` <span style="font-size:10px; color:#475569; font-weight:normal;">(${{rStr}}, ±${{Math.round(m.rmsd)}}m)</span>`;
+    }}
+
     // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
@@ -1427,6 +1530,7 @@ html_content = f"""<!DOCTYPE html>
       updateDprogBadge();
 
       const legendItems = [];
+      const m = currentStepData.metrics || {{}};
 
       function drawLines(layerDict, color, width, alpha, dashArray = []) {{
         if (!layerDict) return;
@@ -1454,60 +1558,60 @@ html_content = f"""<!DOCTYPE html>
       // 1. Members (Spaghetti)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
-          currentStepData.gefs_members.forEach(m => drawLines(m, '#2980b9', 0.9, 0.55));
+          currentStepData.gefs_members.forEach(mem => drawLines(mem, '#2980b9', 0.9, 0.55));
           legendItems.push({{ label: `GEFS Members (${{currentStepData.gefs_members.length}})`, color: '#2980b9', dash: false }});
         }}
         if (showAigefs && currentStepData.aigefs_members) {{
-          currentStepData.aigefs_members.forEach(m => drawLines(m, '#9b59b6', 0.9, 0.55));
+          currentStepData.aigefs_members.forEach(mem => drawLines(mem, '#9b59b6', 0.9, 0.55));
           legendItems.push({{ label: `AIGEFS Members (${{currentStepData.aigefs_members.length}})`, color: '#9b59b6', dash: false }});
         }}
         if (showIfs && currentStepData.ifs_members) {{
-          currentStepData.ifs_members.forEach(m => drawLines(m, '#e74c3c', 0.9, 0.55));
+          currentStepData.ifs_members.forEach(mem => drawLines(mem, '#e74c3c', 0.9, 0.55));
           legendItems.push({{ label: `IFS Members (${{currentStepData.ifs_members.length}})`, color: '#e74c3c', dash: false }});
         }}
         if (showAifs && currentStepData.aifs_members) {{
-          currentStepData.aifs_members.forEach(m => drawLines(m, '#00b894', 0.9, 0.55));
+          currentStepData.aifs_members.forEach(mem => drawLines(mem, '#00b894', 0.9, 0.55));
           legendItems.push({{ label: `AIFS Members (${{currentStepData.aifs_members.length}})`, color: '#00b894', dash: false }});
         }}
       }}
 
-      // 2. Deterministics (Dashed)
+      // 2. Deterministics (Dashed with Live Consensus Metrics)
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
+        legendItems.push({{ label: `GFS Det${{formatConsensusMeta(m.gfs_det)}}`, color: '#001155', dash: true }});
       }}
       if (showAigfs && currentStepData.aigfs_det) {{
         drawLines(currentStepData.aigfs_det, '#4a235a', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: 'AIGFS Det', color: '#4a235a', dash: true }});
+        legendItems.push({{ label: `AIGFS Det${{formatConsensusMeta(m.aigfs_det)}}`, color: '#4a235a', dash: true }});
       }}
       if (showEcmwf && currentStepData.ecmwf_det) {{
         drawLines(currentStepData.ecmwf_det, '#78281f', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: 'IFS Det', color: '#78281f', dash: true }});
+        legendItems.push({{ label: `IFS Det${{formatConsensusMeta(m.ecmwf_det)}}`, color: '#78281f', dash: true }});
       }}
       if (showAifsDet && currentStepData.aifs_det) {{
         drawLines(currentStepData.aifs_det, '#145a32', 2.0, 1.0, [6, 4]);
-        legendItems.push({{ label: 'AIFS Det', color: '#145a32', dash: true }});
+        legendItems.push({{ label: `AIFS Det${{formatConsensusMeta(m.aifs_det)}}`, color: '#145a32', dash: true }});
       }}
 
-      // 3. Ensemble Means
+      // 3. Ensemble Means (with Live Consensus Metrics)
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0044ff', 2.4, 1.0);
-        legendItems.push({{ label: 'GEFS Mean', color: '#0044ff', dash: false }});
+        legendItems.push({{ label: `GEFS Mean${{formatConsensusMeta(m.gefs_mean)}}`, color: '#0044ff', dash: false }});
       }}
       if (showAigefs && currentStepData.aigefs_mean) {{
         drawLines(currentStepData.aigefs_mean, '#8e44ad', 2.4, 1.0);
-        legendItems.push({{ label: 'AIGEFS Mean', color: '#8e44ad', dash: false }});
+        legendItems.push({{ label: `AIGEFS Mean${{formatConsensusMeta(m.aigefs_mean)}}`, color: '#8e44ad', dash: false }});
       }}
       if (showIfs && currentStepData.ifs_mean) {{
         drawLines(currentStepData.ifs_mean, '#d63031', 2.4, 1.0);
-        legendItems.push({{ label: 'IFS Mean', color: '#d63031', dash: false }});
+        legendItems.push({{ label: `IFS Mean${{formatConsensusMeta(m.ifs_mean)}}`, color: '#d63031', dash: false }});
       }}
       if (showAifs && currentStepData.aifs_mean) {{
         drawLines(currentStepData.aifs_mean, '#00b894', 2.4, 1.0);
-        legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
+        legendItems.push({{ label: `AIFS Mean${{formatConsensusMeta(m.aifs_mean)}}`, color: '#00b894', dash: false }});
       }}
 
-      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay with 3-digit zero-padding)
+      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay)
       if (showGhost && currentStepData && currentStepData.valid) {{
         const curIdx = manifestData.runs.findIndex(r => r.id === document.getElementById('runSelect').value);
         if (curIdx !== -1) {{
@@ -1552,7 +1656,7 @@ html_content = f"""<!DOCTYPE html>
       // 5. Superensemble Mean
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
-        legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
+        legendItems.push({{ label: 'Superensemble Mean (Consensus)', color: '#000000', dash: false }});
 
         ctx.font = 'bold 11px sans-serif';
         ctx.fillStyle = '#000';
@@ -1570,7 +1674,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Dynamic Legend
+      // Dynamic Legend Box
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
@@ -1578,6 +1682,186 @@ html_content = f"""<!DOCTYPE html>
           <span>${{item.label}}</span>
         </div>
       `).join('');
+    }}
+
+    // =========================================================================
+    // 10. CONSENSUS TRACKER MODAL & CANVAS CHART RENDERER
+    // =========================================================================
+    const MODEL_STYLES = {{
+      'gefs_mean':   {{ label: 'GEFS Mean', color: '#0044ff', dash: [] }},
+      'aigefs_mean': {{ label: 'AIGEFS Mean', color: '#8e44ad', dash: [] }},
+      'ifs_mean':    {{ label: 'IFS Mean', color: '#d63031', dash: [] }},
+      'aifs_mean':   {{ label: 'AIFS Mean', color: '#00b894', dash: [] }},
+      'gfs_det':     {{ label: 'GFS Det', color: '#001155', dash: [5, 3] }},
+      'aigfs_det':   {{ label: 'AIGFS Det', color: '#4a235a', dash: [5, 3] }},
+      'ecmwf_det':   {{ label: 'IFS Det', color: '#78281f', dash: [5, 3] }},
+      'aifs_det':    {{ label: 'AIFS Det', color: '#145a32', dash: [5, 3] }}
+    }};
+
+    async function openConsensusModal() {{
+      const modal = document.getElementById('consensusModal');
+      modal.classList.add('open');
+      const runId = document.getElementById('runSelect').value;
+
+      if (!consensusDataCache[runId]) {{
+        try {{
+          const resp = await fetch(`runs/${{runId}}/consensus_metrics.json`);
+          consensusDataCache[runId] = await resp.json();
+        }} catch (e) {{
+          console.warn("Could not load consensus_metrics.json for run", runId);
+        }}
+      }}
+      renderConsensusChart();
+    }}
+
+    function closeConsensusModal(e) {{
+      if (e && e.target !== e.currentTarget && !e.target.classList.contains('modal-close')) return;
+      document.getElementById('consensusModal').classList.remove('open');
+    }}
+
+    function renderConsensusChart() {{
+      const runId = document.getElementById('runSelect').value;
+      const dataObj = consensusDataCache[runId];
+      const canvas = document.getElementById('consensusChart');
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width;
+      const H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+
+      const metricType = document.querySelector('input[name="metricType"]:checked').value;
+      const currentLead = parseInt(document.getElementById('leadSelect').value, 10);
+
+      // Margins
+      const padL = 60, padR = 30, padT = 30, padB = 45;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+
+      // Coordinate scaling
+      const xMin = 0, xMax = 240;
+      let yMin = 0.60, yMax = 1.00;
+      if (metricType === 'rmsd') {{
+        yMin = 0;
+        yMax = 90;
+      }}
+
+      function getX(f) {{ return padL + ((f - xMin) / (xMax - xMin)) * plotW; }}
+      function getY(v) {{ return padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH; }}
+
+      // 1. Gridlines & Axes
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1.0;
+      ctx.setLineDash([]);
+      ctx.font = '11px sans-serif';
+      ctx.fillStyle = '#94a3b8';
+
+      // X Gridlines (every 24 hours)
+      for (let f = 0; f <= 240; f += 24) {{
+        const x = getX(f);
+        ctx.beginPath();
+        ctx.moveTo(x, padT);
+        ctx.lineTo(x, padT + plotH);
+        ctx.stroke();
+        ctx.textAlign = 'center';
+        ctx.fillText(`F${{String(f).padStart(3, '0')}}`, x, H - padB + 16);
+      }}
+
+      // Y Gridlines
+      if (metricType === 'r') {{
+        const yTicks = [0.60, 0.70, 0.80, 0.90, 0.95, 1.00];
+        yTicks.forEach(val => {{
+          const y = getY(val);
+          ctx.beginPath();
+          ctx.moveTo(padL, y);
+          ctx.lineTo(W - padR, y);
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText(val.toFixed(2), padL - 8, y + 4);
+        }});
+      }} else {{
+        const yTicks = [0, 20, 40, 60, 80];
+        yTicks.forEach(val => {{
+          const y = getY(val);
+          ctx.beginPath();
+          ctx.moveTo(padL, y);
+          ctx.lineTo(W - padR, y);
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText(`${{val}}m`, padL - 8, y + 4);
+        }});
+      }}
+
+      // Axis Titles
+      ctx.save();
+      ctx.translate(16, padT + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText(metricType === 'r' ? 'Centered Pattern Correlation (r)' : 'Spatial RMS Difference (meters)', 0, 0);
+      ctx.restore();
+
+      // Current Lead Indicator Line
+      const curX = getX(currentLead);
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(curX, padT);
+      ctx.lineTo(curX, padT + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`Active F${{String(currentLead).padStart(3, '0')}}`, curX, padT - 8);
+
+      if (!dataObj || !dataObj.metrics) return;
+
+      // 2. Plot Model Curves
+      const metricsData = dataObj.metrics;
+      const modelKeys = Object.keys(MODEL_STYLES);
+
+      modelKeys.forEach(mKey => {{
+        const style = MODEL_STYLES[mKey];
+        ctx.strokeStyle = style.color;
+        ctx.lineWidth = style.dash.length ? 1.8 : 2.4;
+        ctx.setLineDash(style.dash);
+        ctx.beginPath();
+        let started = false;
+
+        FXX_STEPS.forEach(f => {{
+          const fStr = String(f).padStart(3, '0');
+          const stepMeta = metricsData[fStr];
+          if (stepMeta && stepMeta[mKey]) {{
+            const val = stepMeta[mKey][metricType];
+            if (val !== null && val !== undefined) {{
+              const clampedVal = Math.max(yMin, Math.min(yMax, val));
+              const x = getX(f);
+              const y = getY(clampedVal);
+              if (!started) {{
+                ctx.moveTo(x, y);
+                started = true;
+              }} else {{
+                ctx.lineTo(x, y);
+              }}
+            }}
+          }}
+        }});
+        ctx.stroke();
+      }});
+      ctx.setLineDash([]);
+
+      // 3. Render Modal Legend
+      const legEl = document.getElementById('modalLegend');
+      legEl.innerHTML = modelKeys.map(k => {{
+        const s = MODEL_STYLES[k];
+        return `
+          <div style="display:flex; align-items:center; gap:6px;">
+            <span style="width:18px; height:3px; background:${{s.color}}; display:inline-block; border-bottom:${{s.dash.length ? '2px dashed #000' : 'none'}};"></span>
+            <span>${{s.label}}</span>
+          </div>
+        `;
+      }}).join('');
     }}
 
     async function initViewer() {{
