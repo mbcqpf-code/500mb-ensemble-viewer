@@ -3,9 +3,9 @@ name: 500mb Ensemble Viewer Automation
 on:
   schedule:
     # 06:30 UTC captures the 00Z global packages
-    - cron: '30 6 * * *'
+    - cron: '30 6,8 * * *'
     # 18:30 UTC captures the 12Z global packages
-    - cron: '30 18 * * *'
+    - cron: '30 18,20 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 permissions:
