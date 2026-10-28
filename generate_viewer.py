@@ -29,11 +29,14 @@ OUTPUT_DIR = "output"
 RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
 os.makedirs(RUNS_DIR, exist_ok=True)
 
+# 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
+# Fixed canvas dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
+# High-performance HTTP Session with connection pooling and retries
 http_session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -43,17 +46,16 @@ http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; 
 
 
 # ==============================================================================
-# 2. DYNAMIC CYCLE DETECTOR & VERIFICATION
+# 2. DYNAMIC CYCLE DETECTOR (WITH PINNED 0p25 ECMWF RESOLUTION)
 # ==============================================================================
 def probe_ifs_availability(cycle_str):
-    """Verifies that ECMWF IFS has both GRIB and index file available at F240."""
+    """Verifies that ECMWF IFS 0p25 has both GRIB and index file available at F240."""
     try:
-        H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
-        if H_ifs.grib is not None and H_ifs.idx is not None:
+        H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240, resolution="0p25")
+        if H_ifs.grib is not None:
             return True
-        # Secondary check on HRES deterministic F240
-        H_det = Herbie(cycle_str, model="ifs", product="oper", fxx=240)
-        return H_det.grib is not None and H_det.idx is not None
+        H_det = Herbie(cycle_str, model="ifs", product="oper", fxx=240, resolution="0p25")
+        return H_det.grib is not None
     except Exception:
         return False
 
@@ -83,7 +85,7 @@ def detect_latest_complete_cycle():
     anchor = now.replace(hour=latest_hour, minute=0, second=0, microsecond=0)
     
     candidates = [anchor - timedelta(hours=12 * i) for i in range(4)]
-    print("🔍 Probing candidate cycles for complete global packages (ECMWF IFS + AIGEFS)...")
+    print("🔍 Probing candidate cycles for complete global packages (ECMWF IFS 0p25 + AIGEFS)...")
     
     for cand in candidates:
         cycle_str = cand.strftime('%Y-%m-%d %H:00')
@@ -91,7 +93,7 @@ def detect_latest_complete_cycle():
         
         ifs_ready = probe_ifs_availability(cycle_str)
         if not ifs_ready:
-            print(f"    ↳ ECMWF IFS F240 not complete or index missing for {cycle_str}Z.")
+            print(f"    ↳ ECMWF IFS F240 (0p25) not complete for {cycle_str}Z.")
             continue
             
         aigefs_ready = probe_aigefs_availability(cand)
@@ -120,7 +122,7 @@ os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
 
 # ==============================================================================
-# 3. COMPREHENSIVE CACHE HEALTH CHECK (PURGES INCOMPLETE RUNS)
+# 3. AUTO-HEALTH CHECK (PURGES INCOMPLETE RUNS MISSING IFS)
 # ==============================================================================
 skip_download_and_generation = False
 sample_f000 = os.path.join(CURRENT_DATA_DIR, "f000.json")
@@ -133,22 +135,25 @@ if os.path.exists(sample_f000):
         ifs_mems_count = len(sample_data.get("ifs_members", []))
         ecmwf_det_empty = not bool(sample_data.get("ecmwf_det", {}))
         
-        # Verify that all 21 steps exist
         all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
         all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
-        metrics_exist = os.path.exists(os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json"))
+        metrics_file = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
         
         if ifs_mems_count == 0 or ecmwf_det_empty:
-            print(f"⚠️ Detected cached run {current_cycle_id} is corrupted (missing ECMWF IFS data).")
-            print("🔄 Invalidating bad cache and re-downloading complete cycle...")
-            shutil.rmtree(CURRENT_RUN_DIR)
+            print(f"⚠️ Detected cached run {current_cycle_id} is missing ECMWF IFS data ({ifs_mems_count} members).")
+            print("🔄 Purging this corrupted run folder so it properly re-downloads...")
+            shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
             os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
             os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
             os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
-        elif all_json_exist and all_png_exist and metrics_exist:
-            skip_download_and_generation = True
-            print(f"⚡ Cycle {current_cycle_id} verified complete with all members and models intact!")
-            print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
+        elif all_json_exist and all_png_exist and os.path.exists(metrics_file):
+            with open(metrics_file, "r") as mf:
+                mdata = json.load(mf)
+                sample_step = mdata.get("metrics", {}).get("000", {})
+                if "score" in sample_step.get("gefs_mean", {}):
+                    skip_download_and_generation = True
+                    print(f"⚡ Cycle {current_cycle_id} verified complete with all members and models intact!")
+                    print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
     except Exception as e:
         print(f"⚠️ Error verifying cached cycle: {e}. Purging directory to re-download.")
         shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
@@ -252,7 +257,7 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 6. DATA FETCHERS WITH RETRIES & MULTI-TYPE FALLBACKS
+# 6. DATA FETCHERS WITH RESOLUTION PINNING & RETRIES
 # ==============================================================================
 def fetch_gefs_lead(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
@@ -330,49 +335,35 @@ def fetch_aigefs_ensemble(fxx):
     return grids
 
 def fetch_ifs_ensemble(fxx):
-    """Fetches ECMWF IFS ensemble with retry and dataType key filtering."""
+    """Fetches ECMWF IFS ensemble members with pinned 0p25 resolution and dataType separation."""
     grids = []
-    for attempt in range(2):
-        try:
-            H = Herbie(global_init_time, model="ifs", product="enfo", fxx=fxx)
-            # Try direct extraction first
-            try:
-                ds_list = H.xarray(":gh:500")
-                if not isinstance(ds_list, list):
-                    ds_list = [ds_list]
-                for ds in ds_list:
-                    g = standardize_grid(ds)
-                    if g is not None:
-                        if g.ndim == 3:
-                            for i in range(g.shape[0]):
-                                grids.append(g[i])
-                        elif g.ndim == 2:
-                            grids.append(g)
-            except Exception:
-                pass
-
-            # If direct failed or returned no members, try dataType filtering
-            if len(grids) == 0:
-                for dt in ["pf", "cf"]:
-                    try:
-                        ds = H.xarray(":gh:500", backend_kwargs={"filter_by_keys": {"dataType": dt}})
-                        g = standardize_grid(ds)
-                        if g is not None:
-                            if g.ndim == 3:
-                                for i in range(g.shape[0]):
-                                    grids.append(g[i])
-                            elif g.ndim == 2:
+    try:
+        H = Herbie(global_init_time, model="ifs", product="enfo", fxx=fxx, resolution="0p25")
+        for data_type in ["pf", "cf"]:
+            for sq in [":gh:500", ":gh:500:", ":z:500:"]:
+                try:
+                    ds = H.xarray(sq, backend_kwargs={"filter_by_keys": {"dataType": data_type}})
+                    ds_list = ds if isinstance(ds, list) else [ds]
+                    for d in ds_list:
+                        var_key = list(d.data_vars)[0]
+                        da = d[var_key].squeeze()
+                        dim_names = list(da.dims)
+                        if any(dim in dim_names for dim in ['number', 'realization']):
+                            m_dim = 'number' if 'number' in dim_names else 'realization'
+                            for m_idx in range(len(da[m_dim])):
+                                g = standardize_grid(da.isel({m_dim: m_idx}).to_dataset(name=var_key))
+                                if g is not None and g.ndim == 2:
+                                    grids.append(g)
+                        else:
+                            g = standardize_grid(da.to_dataset(name=var_key))
+                            if g is not None and g.ndim == 2:
                                 grids.append(g)
-                    except Exception:
-                        continue
-
-            if len(grids) > 0:
-                return grids
-        except Exception as e:
-            if attempt == 0:
-                time.sleep(2)
-            else:
-                print(f"    ⚠️ Warning: Failed to retrieve ECMWF IFS ensemble at F{fxx:03d}: {e}")
+                    if len(grids) > 0:
+                        break
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"⚠️ Exception in fetch_ifs_ensemble F{fxx:03d}: {e}")
     return grids
 
 def fetch_aifs_ensemble(fxx):
@@ -405,18 +396,20 @@ def fetch_aifs_ensemble(fxx):
     return grids
 
 def fetch_deterministic(model_name, product, search_str, fxx):
-    for attempt in range(2):
-        try:
-            H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
-            ds = H.xarray(search_str)
-            if isinstance(ds, list):
-                ds = ds[0]
-            g = standardize_grid(ds)
-            if g is not None and g.ndim == 2:
-                return g
-        except Exception:
-            if attempt == 0:
-                time.sleep(2)
+    try:
+        kwargs = {"model": model_name, "product": product, "fxx": fxx}
+        if model_name == "ifs":
+            kwargs["resolution"] = "0p25"
+        H = Herbie(global_init_time, **kwargs)
+        ds = H.xarray(search_str)
+        if isinstance(ds, list):
+            ds = ds[0]
+        g = standardize_grid(ds)
+        if g is not None and g.ndim == 2:
+            return g
+    except Exception as e:
+        if model_name == "ifs":
+            print(f"⚠️ Error fetching IFS Det F{fxx:03d}: {e}")
     return None
 
 def fetch_aigfs(fxx):
@@ -478,9 +471,16 @@ ENS_OUTLIER_COLORS = {
 }
 
 def compute_consensus_metrics(model_grid, super_mean):
+    """
+    Computes:
+      1. Zonal Anomaly (Eddy) Pattern Correlation (r_eddy): isolates troughs/ridges by removing latitudinal mean.
+      2. Spatial Root-Mean-Square Difference (RMSD): measures absolute height and amplitude departure in meters.
+      3. Composite Consensus Match Score (0 - 100%): 60% r_eddy + 40% RMSD.
+    """
     if model_grid is None or super_mean is None or np.all(np.isnan(model_grid)) or np.all(np.isnan(super_mean)):
         return {"r": None, "rmsd": None, "score": None}
     try:
+        # Subtract the zonal mean across longitudes for each latitude row (axis=1)
         m_eddy = model_grid - np.nanmean(model_grid, axis=1, keepdims=True)
         s_eddy = super_mean - np.nanmean(super_mean, axis=1, keepdims=True)
         
