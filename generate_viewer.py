@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import shutil
 import warnings
 import tempfile
@@ -28,14 +29,11 @@ OUTPUT_DIR = "output"
 RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
 os.makedirs(RUNS_DIR, exist_ok=True)
 
-# 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
 ALL_CONTOURS = list(range(4980, 6001, 60))
 
-# Fixed canvas dimensions (1200x800)
 CANVAS_W, CANVAS_H = 1200, 800
 
-# High-performance HTTP Session with connection pooling and retries
 http_session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -45,55 +43,64 @@ http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; 
 
 
 # ==============================================================================
-# 2. DYNAMIC CYCLE DETECTOR & IDEMPOTENCY CHECK
+# 2. DYNAMIC CYCLE DETECTOR & VERIFICATION
 # ==============================================================================
+def probe_ifs_availability(cycle_str):
+    """Verifies that ECMWF IFS has both GRIB and index file available at F240."""
+    try:
+        H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
+        if H_ifs.grib is not None and H_ifs.idx is not None:
+            return True
+        # Secondary check on HRES deterministic F240
+        H_det = Herbie(cycle_str, model="ifs", product="oper", fxx=240)
+        return H_det.grib is not None and H_det.idx is not None
+    except Exception:
+        return False
+
+def probe_aigefs_availability(cand):
+    date_nomads = cand.strftime('%Y%m%d')
+    cycle_nomads = cand.strftime('%H')
+    url_aigefs = (
+        f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/"
+        f"aigefs.{date_nomads}/{cycle_nomads}/mem000/model/atmos/grib2/"
+        f"aigefs.t{cycle_nomads}z.pres.f240.grib2.idx"
+    )
+    try:
+        resp = http_session.head(url_aigefs, timeout=5)
+        if resp.status_code == 200:
+            return True
+    except Exception:
+        pass
+    try:
+        H_ai = Herbie(cand.strftime('%Y-%m-%d %H:00'), model="aigefs", product="pres", member="mem000", fxx=240)
+        return H_ai.grib is not None
+    except Exception:
+        return False
+
 def detect_latest_complete_cycle():
-    """Probes candidate synoptic cycles and locks onto the latest completed F240 run."""
     now = datetime.utcnow()
     latest_hour = 12 if now.hour >= 12 else 0
     anchor = now.replace(hour=latest_hour, minute=0, second=0, microsecond=0)
     
     candidates = [anchor - timedelta(hours=12 * i) for i in range(4)]
-    print("🔍 Probing for newest complete 240h ensemble cycle...")
+    print("🔍 Probing candidate cycles for complete global packages (ECMWF IFS + AIGEFS)...")
     
     for cand in candidates:
         cycle_str = cand.strftime('%Y-%m-%d %H:00')
         print(f"  • Checking candidate cycle: {cycle_str}Z...")
         
-        ifs_ready = False
-        try:
-            H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
-            if H_ifs.grib is not None:
-                ifs_ready = True
-        except Exception:
-            pass
-
+        ifs_ready = probe_ifs_availability(cycle_str)
         if not ifs_ready:
-            print(f"    ↳ ECMWF IFS F240 not complete for {cycle_str}Z.")
+            print(f"    ↳ ECMWF IFS F240 not complete or index missing for {cycle_str}Z.")
+            continue
+            
+        aigefs_ready = probe_aigefs_availability(cand)
+        if not aigefs_ready:
+            print(f"    ↳ NOAA AIGEFS F240 not complete for {cycle_str}Z.")
             continue
 
-        aigefs_ready = False
-        date_nomads = cand.strftime('%Y%m%d')
-        cycle_nomads = cand.strftime('%H')
-        url_aigefs = (
-            f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/"
-            f"aigefs.{date_nomads}/{cycle_nomads}/mem000/model/atmos/grib2/"
-            f"aigefs.t{cycle_nomads}z.pres.f240.grib2.idx"
-        )
-        try:
-            resp = http_session.head(url_aigefs, timeout=5)
-            if resp.status_code == 200:
-                aigefs_ready = True
-            else:
-                H_ai = Herbie(cycle_str, model="aigefs", product="pres", member="mem000", fxx=240)
-                if H_ai.grib is not None:
-                    aigefs_ready = True
-        except Exception:
-            pass
-
-        if ifs_ready and aigefs_ready:
-            print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
-            return cycle_str
+        print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
+        return cycle_str
 
     fallback_str = candidates[1].strftime('%Y-%m-%d %H:00')
     print(f"⚠️ Falling back to verified baseline: {fallback_str}Z\n")
@@ -111,24 +118,43 @@ os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
-# Idempotency Check: Verify that all data files exist AND that consensus_metrics has composite scores
+
+# ==============================================================================
+# 3. COMPREHENSIVE CACHE HEALTH CHECK (PURGES INCOMPLETE RUNS)
+# ==============================================================================
 skip_download_and_generation = False
-if os.path.exists(CURRENT_DATA_DIR) and os.path.exists(CURRENT_SPREAD_DIR):
-    all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
-    all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
-    metrics_file = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
-    if all_json_exist and all_png_exist and os.path.exists(metrics_file):
-        try:
-            with open(metrics_file, "r") as mf:
-                mdata = json.load(mf)
-                sample_step = mdata.get("metrics", {}).get("000", {})
-                sample_m = sample_step.get("gefs_mean", {})
-                if "score" in sample_m:
-                    skip_download_and_generation = True
-                    print(f"⚡ Cycle {current_cycle_id} already exists with complete 240h data and composite scores!")
-                    print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
-        except Exception:
-            pass
+sample_f000 = os.path.join(CURRENT_DATA_DIR, "f000.json")
+
+if os.path.exists(sample_f000):
+    try:
+        with open(sample_f000, "r") as f:
+            sample_data = json.load(f)
+            
+        ifs_mems_count = len(sample_data.get("ifs_members", []))
+        ecmwf_det_empty = not bool(sample_data.get("ecmwf_det", {}))
+        
+        # Verify that all 21 steps exist
+        all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
+        all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
+        metrics_exist = os.path.exists(os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json"))
+        
+        if ifs_mems_count == 0 or ecmwf_det_empty:
+            print(f"⚠️ Detected cached run {current_cycle_id} is corrupted (missing ECMWF IFS data).")
+            print("🔄 Invalidating bad cache and re-downloading complete cycle...")
+            shutil.rmtree(CURRENT_RUN_DIR)
+            os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
+            os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
+            os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
+        elif all_json_exist and all_png_exist and metrics_exist:
+            skip_download_and_generation = True
+            print(f"⚡ Cycle {current_cycle_id} verified complete with all members and models intact!")
+            print("⏩ Skipping download and grid extraction. Proceeding directly to archive and frontend updates.\n")
+    except Exception as e:
+        print(f"⚠️ Error verifying cached cycle: {e}. Purging directory to re-download.")
+        shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
+        os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
+        os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
+        os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
 # Synoptic CONUS domain
 lon_min, lon_max = -130.0, -60.0
@@ -139,7 +165,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 3. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
+# 4. BASEMAP GENERATION & GEOGRAPHIC TRANSFORM
 # ==============================================================================
 basemap_path = os.path.join(OUTPUT_DIR, "basemap.png")
 fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -161,7 +187,7 @@ geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
 
 
 # ==============================================================================
-# 4. GRID STANDARDIZATION & VECTOR EXTRACTION
+# 5. GRID STANDARDIZATION & VECTOR EXTRACTION
 # ==============================================================================
 def standardize_grid(ds):
     if ds is None:
@@ -226,16 +252,20 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 5. DATA FETCHERS (BALANCED 2x2 ENSEMBLES + DETERMINISTICS)
+# 6. DATA FETCHERS WITH RETRIES & MULTI-TYPE FALLBACKS
 # ==============================================================================
 def fetch_gefs_lead(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
     def _worker(m):
-        try:
-            H = Herbie(global_init_time, model="gefs", product="atmos.5", member=m, fxx=fxx)
-            return standardize_grid(H.xarray(":HGT:500 mb:"))
-        except Exception:
-            return None
+        for attempt in range(2):
+            try:
+                H = Herbie(global_init_time, model="gefs", product="atmos.5", member=m, fxx=fxx)
+                grid = standardize_grid(H.xarray(":HGT:500 mb:"))
+                if grid is not None and grid.ndim == 2:
+                    return grid
+            except Exception:
+                time.sleep(1)
+        return None
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
@@ -300,22 +330,49 @@ def fetch_aigefs_ensemble(fxx):
     return grids
 
 def fetch_ifs_ensemble(fxx):
+    """Fetches ECMWF IFS ensemble with retry and dataType key filtering."""
     grids = []
-    try:
-        H = Herbie(global_init_time, model="ifs", product="enfo", fxx=fxx)
-        ds_list = H.xarray(":gh:500")
-        if not isinstance(ds_list, list):
-            ds_list = [ds_list]
-        for ds in ds_list:
-            g = standardize_grid(ds)
-            if g is not None:
-                if g.ndim == 3:
-                    for i in range(g.shape[0]):
-                        grids.append(g[i])
-                elif g.ndim == 2:
-                    grids.append(g)
-    except Exception:
-        pass
+    for attempt in range(2):
+        try:
+            H = Herbie(global_init_time, model="ifs", product="enfo", fxx=fxx)
+            # Try direct extraction first
+            try:
+                ds_list = H.xarray(":gh:500")
+                if not isinstance(ds_list, list):
+                    ds_list = [ds_list]
+                for ds in ds_list:
+                    g = standardize_grid(ds)
+                    if g is not None:
+                        if g.ndim == 3:
+                            for i in range(g.shape[0]):
+                                grids.append(g[i])
+                        elif g.ndim == 2:
+                            grids.append(g)
+            except Exception:
+                pass
+
+            # If direct failed or returned no members, try dataType filtering
+            if len(grids) == 0:
+                for dt in ["pf", "cf"]:
+                    try:
+                        ds = H.xarray(":gh:500", backend_kwargs={"filter_by_keys": {"dataType": dt}})
+                        g = standardize_grid(ds)
+                        if g is not None:
+                            if g.ndim == 3:
+                                for i in range(g.shape[0]):
+                                    grids.append(g[i])
+                            elif g.ndim == 2:
+                                grids.append(g)
+                    except Exception:
+                        continue
+
+            if len(grids) > 0:
+                return grids
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                print(f"    ⚠️ Warning: Failed to retrieve ECMWF IFS ensemble at F{fxx:03d}: {e}")
     return grids
 
 def fetch_aifs_ensemble(fxx):
@@ -348,16 +405,18 @@ def fetch_aifs_ensemble(fxx):
     return grids
 
 def fetch_deterministic(model_name, product, search_str, fxx):
-    try:
-        H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
-        ds = H.xarray(search_str)
-        if isinstance(ds, list):
-            ds = ds[0]
-        g = standardize_grid(ds)
-        if g is not None and g.ndim == 2:
-            return g
-    except Exception:
-        pass
+    for attempt in range(2):
+        try:
+            H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
+            ds = H.xarray(search_str)
+            if isinstance(ds, list):
+                ds = ds[0]
+            g = standardize_grid(ds)
+            if g is not None and g.ndim == 2:
+                return g
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
     return None
 
 def fetch_aigfs(fxx):
@@ -376,7 +435,7 @@ def fetch_aigfs(fxx):
 
 
 # ==============================================================================
-# 6. SPREAD, TREND & CONSENSUS ENGINE
+# 7. SPREAD, TREND & CONSENSUS ENGINE
 # ==============================================================================
 SPREAD_LEVELS = np.arange(10, 130, 10)
 SPREAD_CMAP = plt.cm.YlOrRd
@@ -419,16 +478,9 @@ ENS_OUTLIER_COLORS = {
 }
 
 def compute_consensus_metrics(model_grid, super_mean):
-    """
-    Computes:
-      1. Zonal Anomaly (Eddy) Pattern Correlation (r_eddy): isolates troughs/ridges by removing latitudinal mean.
-      2. Spatial Root-Mean-Square Difference (RMSD): measures absolute height and amplitude departure in meters.
-      3. Composite Consensus Match Score (0 - 100%): 60% r_eddy + 40% RMSD.
-    """
     if model_grid is None or super_mean is None or np.all(np.isnan(model_grid)) or np.all(np.isnan(super_mean)):
         return {"r": None, "rmsd": None, "score": None}
     try:
-        # Subtract the zonal mean across longitudes for each latitude row (axis=1)
         m_eddy = model_grid - np.nanmean(model_grid, axis=1, keepdims=True)
         s_eddy = super_mean - np.nanmean(super_mean, axis=1, keepdims=True)
         
@@ -438,7 +490,6 @@ def compute_consensus_metrics(model_grid, super_mean):
         
         rmsd_val = float(np.sqrt(np.nanmean((model_grid - super_mean)**2)))
         
-        # Composite score calculation (0 - 100%)
         r_comp = max(0.0, r_eddy)
         rmsd_comp = max(0.0, 1.0 - (rmsd_val / 60.0))
         score = int(round(100.0 * (0.60 * r_comp + 0.40 * rmsd_comp)))
@@ -633,7 +684,7 @@ def render_ensemble_lone_wolf(means_dict, spr_inter, filename, target_dir):
 
 
 # ==============================================================================
-# 7. BATCH PRODUCTION LOOP (ONLY EXECUTED IF RUN IS NOT ALREADY CACHED)
+# 8. BATCH PRODUCTION LOOP
 # ==============================================================================
 all_run_metrics = {}
 
@@ -666,7 +717,7 @@ if not skip_download_and_generation:
         det_aifs  = fetch_deterministic("aifs", "oper", ":z:500:", fxx)
         det_aigfs = fetch_aigfs(fxx)
 
-        # 4. Compute Zonal Anomaly Correlation & Composite Match Scores vs Super Mean
+        # 4. Consensus Metrics
         step_metrics = {
             "gefs_mean": compute_consensus_metrics(gefs_mean, super_mean),
             "aigefs_mean": compute_consensus_metrics(aigefs_mean, super_mean),
@@ -682,7 +733,7 @@ if not skip_download_and_generation:
         # 5. Spread Diagnostics
         spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-        # 6. Save compact 2D grids for trend / archive calculations
+        # 6. Save compact 2D grids for trend calculations
         if super_mean is not None and spread_diags['inter'] is not None:
             np.savez_compressed(
                 os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
@@ -774,7 +825,6 @@ if not skip_download_and_generation:
         with open(json_path, "w") as f:
             json.dump(step_data, f, separators=(',', ':'))
 
-    # Save aggregated consensus metrics for full lead-time tracking
     metrics_summary_path = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
     with open(metrics_summary_path, "w") as f:
         json.dump({"init": global_init_time, "metrics": all_run_metrics}, f, indent=2)
@@ -784,7 +834,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 10 RUNS)
+# 9. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 10 RUNS)
 # ==============================================================================
 print("\n🗄️ Managing 10-Run Archive...")
 all_cycles = sorted(
@@ -821,7 +871,7 @@ print(f"✅ Generated manifest.json with {len(manifest['runs'])} available cycle
 
 
 # ==============================================================================
-# 9. GENERATE DYNAMIC HTML FRONTEND (WITH EDDY & COMPOSITE SCORE INTEGRATION)
+# 10. GENERATE DYNAMIC HTML FRONTEND
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -955,7 +1005,6 @@ html_content = f"""<!DOCTYPE html>
       font-size: 11.5px; color: #94a3b8; font-style: italic; margin-top: -4px;
     }}
 
-    /* Modal Overlay Styles for Consensus Tracker Chart */
     .modal-overlay {{
       display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
       background: rgba(0, 0, 0, 0.75); z-index: 9999; justify-content: center; align-items: center;
@@ -999,7 +1048,6 @@ html_content = f"""<!DOCTYPE html>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Model Cycle Selection & dprog/dt Sync -->
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <b>Model Run:</b>
@@ -1016,7 +1064,6 @@ html_content = f"""<!DOCTYPE html>
         <span id="dprogStatus" style="color: #cbd5e1; font-size: 11px; margin-left: 4px;"></span>
       </div>
 
-      <!-- Reorganized Underlay Selection with Tooltip -->
       <div style="display: flex; gap: 8px; align-items: center;">
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
@@ -1062,12 +1109,10 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Inline 1-Line Underlay Summary -->
     <div class="underlay-desc-bar" id="underlayDescBar">
       Clean basemap with interactive vector contours on top.
     </div>
 
-    <!-- Row 2: Lead Scrubbing, Display Mode, and Consensus Modal Trigger -->
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <b>Forecast Lead:</b>
@@ -1089,7 +1134,6 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 3: Structured Model Toggles & Ghost Trails -->
     <div class="model-group-row">
       <div class="group-line">
         <span class="group-label">
@@ -1124,7 +1168,6 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 4: Height Contours (4980 to 6000m) -->
     <div class="contour-section">
       <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
         <span style="font-size: 12px; font-weight: bold;">Contour Levels (m):</span>
@@ -1136,7 +1179,6 @@ html_content = f"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Map Card -->
   <div class="viewer-card">
     <img id="mapUnderlay" src="basemap.png" alt="CONUS Basemap">
     <canvas id="contourCanvas" width="1200" height="800"></canvas>
@@ -1148,7 +1190,6 @@ html_content = f"""<!DOCTYPE html>
     <div class="legend-box" id="legendBox"></div>
   </div>
 
-  <!-- Consensus Tracker Modal Dialogue -->
   <div id="consensusModal" class="modal-overlay" onclick="closeConsensusModal(event)">
     <div class="modal-content" onclick="event.stopPropagation()">
       <div class="modal-header">
@@ -1321,7 +1362,6 @@ html_content = f"""<!DOCTYPE html>
       return Date.UTC(yr, mo, da, hr, 0, 0);
     }}
 
-    // Contour Selector Chips
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
@@ -1524,7 +1564,6 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowDown') {{ e.preventDefault(); stepRun(1); }}
     }});
 
-    // Helper to format live consensus correlation & rmsd for legend
     function formatConsensusMeta(m, isTop) {{
       if (!m || m.score === null || m.score === undefined) return '';
       const rStr = m.r >= 0 ? `+${{m.r.toFixed(2)}}` : `${{m.r.toFixed(2)}}`;
@@ -1532,7 +1571,6 @@ html_content = f"""<!DOCTYPE html>
       return ` <span style="font-size:10.5px; color:#334155; font-weight:bold;">[${{m.score}}%]</span> <span style="font-size:10px; color:#64748b; font-weight:normal;">(r=${{rStr}}, ±${{Math.round(m.rmsd)}}m)${{medal}}</span>`;
     }}
 
-    // Canvas Renderer
     function draw() {{
       if (!currentStepData) return;
       const canvas = document.getElementById('contourCanvas');
@@ -1560,7 +1598,6 @@ html_content = f"""<!DOCTYPE html>
       const legendItems = [];
       const m = currentStepData.metrics || {{}};
 
-      // Find top scoring active model for gold badge
       let topScore = -1;
       let topModelKey = null;
       const activeKeys = [];
@@ -1603,7 +1640,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // 1. Members (Spaghetti)
       if (isSpaghetti) {{
         if (showGefs && currentStepData.gefs_members) {{
           currentStepData.gefs_members.forEach(mem => drawLines(mem, '#2980b9', 0.9, 0.55));
@@ -1623,7 +1659,6 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Deterministics (Dashed with Live Consensus Metrics)
       if (showGfs && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 2.0, 1.0, [6, 4]);
         legendItems.push({{ label: `GFS Det${{formatConsensusMeta(m.gfs_det, topModelKey === 'gfs_det')}}`, color: '#001155', dash: true }});
@@ -1641,7 +1676,6 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: `AIFS Det${{formatConsensusMeta(m.aifs_det, topModelKey === 'aifs_det')}}`, color: '#145a32', dash: true }});
       }}
 
-      // 3. Ensemble Means (with Live Consensus Metrics)
       if (showGefs && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0044ff', 2.4, 1.0);
         legendItems.push({{ label: `GEFS Mean${{formatConsensusMeta(m.gefs_mean, topModelKey === 'gefs_mean')}}`, color: '#0044ff', dash: false }});
@@ -1659,7 +1693,6 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: `AIFS Mean${{formatConsensusMeta(m.aifs_mean, topModelKey === 'aifs_mean')}}`, color: '#00b894', dash: false }});
       }}
 
-      // 4. Past 3 Runs Ghost Trails (dprog/dt overlay)
       if (showGhost && currentStepData && currentStepData.valid) {{
         const curIdx = manifestData.runs.findIndex(r => r.id === document.getElementById('runSelect').value);
         if (curIdx !== -1) {{
@@ -1701,7 +1734,6 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 5. Superensemble Mean
       if (showSuper && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.2, 1.0);
         legendItems.push({{ label: 'Superensemble Mean (Consensus)', color: '#000000', dash: false }});
@@ -1722,7 +1754,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Dynamic Legend Box
       const legendBox = document.getElementById('legendBox');
       legendBox.innerHTML = legendItems.map(item => `
         <div class="legend-line">
@@ -1732,9 +1763,6 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
-    // =========================================================================
-    // 10. CONSENSUS TRACKER MODAL & CANVAS CHART RENDERER
-    // =========================================================================
     const MODEL_STYLES = {{
       'gefs_mean':   {{ label: 'GEFS Mean', color: '#0044ff', dash: [] }},
       'aigefs_mean': {{ label: 'AIGEFS Mean', color: '#8e44ad', dash: [] }},
@@ -1796,14 +1824,12 @@ html_content = f"""<!DOCTYPE html>
       function getX(f) {{ return padL + ((f - xMin) / (xMax - xMin)) * plotW; }}
       function getY(v) {{ return padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH; }}
 
-      // 1. Gridlines & Axes
       ctx.strokeStyle = '#334155';
       ctx.lineWidth = 1.0;
       ctx.setLineDash([]);
       ctx.font = '11px sans-serif';
       ctx.fillStyle = '#94a3b8';
 
-      // X Gridlines (every 24 hours)
       for (let f = 0; f <= 240; f += 24) {{
         const x = getX(f);
         ctx.beginPath();
@@ -1814,7 +1840,6 @@ html_content = f"""<!DOCTYPE html>
         ctx.fillText(`F${{String(f).padStart(3, '0')}}`, x, H - padB + 16);
       }}
 
-      // Y Gridlines
       if (metricType === 'score') {{
         const yTicks = [0, 25, 50, 75, 100];
         yTicks.forEach(val => {{
@@ -1850,7 +1875,6 @@ html_content = f"""<!DOCTYPE html>
         }});
       }}
 
-      // Axis Titles
       ctx.save();
       ctx.translate(16, padT + plotH / 2);
       ctx.rotate(-Math.PI / 2);
@@ -1863,7 +1887,6 @@ html_content = f"""<!DOCTYPE html>
       ctx.fillText(yAxisTitle, 0, 0);
       ctx.restore();
 
-      // Current Lead Indicator Line
       const curX = getX(currentLead);
       ctx.strokeStyle = '#f59e0b';
       ctx.lineWidth = 1.5;
@@ -1880,7 +1903,6 @@ html_content = f"""<!DOCTYPE html>
 
       if (!dataObj || !dataObj.metrics) return;
 
-      // 2. Plot Model Curves
       const metricsData = dataObj.metrics;
       const modelKeys = Object.keys(MODEL_STYLES);
 
@@ -1914,7 +1936,6 @@ html_content = f"""<!DOCTYPE html>
       }});
       ctx.setLineDash([]);
 
-      // 3. Render Modal Legend
       const legEl = document.getElementById('modalLegend');
       legEl.innerHTML = modelKeys.map(k => {{
         const s = MODEL_STYLES[k];
