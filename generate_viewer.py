@@ -123,6 +123,18 @@ os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
+# Auto-migrate any legacy NPZ grids from output/runs/ to backend_grids/
+if os.path.exists(RUNS_DIR):
+    for c_dir in os.listdir(RUNS_DIR):
+        legacy_grids = os.path.join(RUNS_DIR, c_dir, "grids")
+        if os.path.isdir(legacy_grids):
+            target_dir = os.path.join(GRIDS_CACHE_DIR, c_dir)
+            os.makedirs(target_dir, exist_ok=True)
+            for fn in os.listdir(legacy_grids):
+                if fn.endswith(".npz"):
+                    shutil.copy2(os.path.join(legacy_grids, fn), os.path.join(target_dir, fn))
+            shutil.rmtree(legacy_grids, ignore_errors=True)
+
 
 # ==============================================================================
 # 3. AUTO-HEALTH CHECK (PURGES INCOMPLETE RUNS MISSING IFS)
@@ -775,8 +787,14 @@ if not skip_download_and_generation:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    past_npz_path = os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz")
-                    if os.path.exists(past_npz_path):
+                    candidate_paths = [
+                        os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz"),
+                        os.path.join(GRIDS_CACHE_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
+                        os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
+                        os.path.join(RUNS_DIR, past_id, f"f{past_fxx:03d}.npz")
+                    ]
+                    past_npz_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+                    if past_npz_path:
                         with np.load(past_npz_path) as data:
                             past_means.append(data['super_mean'])
                             past_spr_inters.append(data['spr_inter'])
@@ -832,6 +850,67 @@ if not skip_download_and_generation:
     with open(metrics_summary_path, "w") as f:
         json.dump({"init": global_init_time, "metrics": all_run_metrics}, f, indent=2)
     print(f"✅ Saved consensus_metrics.json for cycle {current_cycle_id}")
+
+else:
+    print("\n🎨 Re-rendering multi-run trend underlays from cached NPZ grids...")
+    prior_cycles = sorted(
+        [d for d in os.listdir(RUNS_DIR) if d < current_cycle_id and os.path.isdir(os.path.join(RUNS_DIR, d))],
+        reverse=True
+    )
+    for fxx in FXX_STEPS:
+        valid_time = date_dt + timedelta(hours=fxx)
+        cur_candidates = [
+            os.path.join(GRIDS_CACHE_DIR, current_cycle_id, f"f{fxx:03d}.npz"),
+            os.path.join(RUNS_DIR, current_cycle_id, "grids", f"f{fxx:03d}.npz")
+        ]
+        cur_npz = next((p for p in cur_candidates if os.path.exists(p)), None)
+        if not cur_npz:
+            continue
+
+        with np.load(cur_npz) as cdata:
+            super_mean = cdata['super_mean']
+            spr_inter = cdata['spr_inter']
+
+        past_means = [super_mean]
+        past_spr_inters = [spr_inter]
+
+        for past_id in prior_cycles[:3]:
+            try:
+                past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
+                past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
+                if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
+                    cand_paths = [
+                        os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz"),
+                        os.path.join(GRIDS_CACHE_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
+                        os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
+                        os.path.join(RUNS_DIR, past_id, f"f{past_fxx:03d}.npz")
+                    ]
+                    p_path = next((p for p in cand_paths if os.path.exists(p)), None)
+                    if p_path:
+                        with np.load(p_path) as pdata:
+                            past_means.append(pdata['super_mean'])
+                            past_spr_inters.append(pdata['spr_inter'])
+            except Exception:
+                pass
+
+        delta_spr_inter = past_spr_inters[0] - past_spr_inters[1] if len(past_spr_inters) >= 2 else None
+        render_contourf_underlay(delta_spr_inter, CONV_LEVELS, CONV_CMAP, CONV_NORM, f"convergence_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+
+        if len(past_means) >= 2:
+            increments = [past_means[i] - past_means[i+1] for i in range(len(past_means) - 1)]
+            delta_net = past_means[0] - past_means[-1]
+            path_length = np.sum([np.abs(inc) for inc in increments], axis=0)
+            mono_ratio = delta_net / (path_length + 1e-5)
+            monotonic_trend = delta_net * np.abs(mono_ratio)
+            flip_flop_energy = path_length - np.abs(delta_net)
+        else:
+            monotonic_trend = None
+            flip_flop_energy = None
+
+        render_contourf_underlay(monotonic_trend, DIFF_LEVELS, DIFF_CMAP, DIFF_NORM, f"monotonic_trend_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='both')
+        render_contourf_underlay(flip_flop_energy, FLIP_LEVELS, FLIP_CMAP, None, f"flipflop_f{fxx:03d}.png", CURRENT_SPREAD_DIR, extend='max')
+
+    print("✅ Multi-run trend underlays updated successfully!")
 
 plt.close(fig)
 
