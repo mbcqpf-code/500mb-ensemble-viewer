@@ -1,64 +1,76 @@
-name: 500mb Ensemble Viewer Automation
+name: Generate and Deploy 500mb Ensembles
 
 on:
   schedule:
-    # 06:30 UTC captures the 00Z global packages
-    - cron: '30 6 * * *'
-    # 18:30 UTC captures the 12Z global packages
-    - cron: '30 18 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+    - cron: '30 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: 'pages'
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install System GIS Dependencies
+      - name: Install System Geospatial Libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y libgeos-dev libproj-dev proj-data proj-bin libeccodes-dev
 
-      - name: Install Python Dependencies
+      - name: Install Python Packages
         run: |
           pip install --upgrade pip
           pip install herbie-data cartopy cfgrib eccodes xarray scipy matplotlib requests
 
-      - name: Restore Previous Runs Archive Cache
+      - name: Restore Multi-Run Archive
         uses: actions/cache@v4
         with:
-          path: output/runs
+          path: |
+            output/runs
+            backend_grids
           key: viewer-archive-${{ github.run_id }}
           restore-keys: |
             viewer-archive-
 
-      - name: Run 500mb Height Generator
+      - name: Run 500mb Generator
         run: |
           python generate_viewer.py
 
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
 
-      - name: Upload Pages Artifact
+      - name: Upload Artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: 'output'
+          path: output
 
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
