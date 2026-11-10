@@ -27,7 +27,10 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 OUTPUT_DIR = "output"
 RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
+# Store backend NPZ grids OUTSIDE the output/ folder so they are not uploaded to Pages
+GRIDS_CACHE_DIR = "backend_grids"
 os.makedirs(RUNS_DIR, exist_ok=True)
+os.makedirs(GRIDS_CACHE_DIR, exist_ok=True)
 
 # 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
@@ -115,7 +118,7 @@ current_cycle_id = date_dt.strftime('%Y%m%d_%H')
 CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
 CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
 CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
-CURRENT_GRIDS_DIR = os.path.join(CURRENT_RUN_DIR, "grids")
+CURRENT_GRIDS_DIR = os.path.join(GRIDS_CACHE_DIR, current_cycle_id)
 os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
@@ -772,7 +775,7 @@ if not skip_download_and_generation:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    past_npz_path = os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz")
                     if os.path.exists(past_npz_path):
                         with np.load(past_npz_path) as data:
                             past_means.append(data['super_mean'])
@@ -842,12 +845,12 @@ all_cycles = sorted(
     reverse=True
 )
 
-if len(all_cycles) > 10:
-    for old_cycle in all_cycles[10:]:
+# Keep the 5 most recent runs with full PNGs to stay comfortably under GitHub's 1GB limit
+if len(all_cycles) > 6:
+    for old_cycle in all_cycles[6:]:
         old_path = os.path.join(RUNS_DIR, old_cycle)
-        print(f"  🗑️ Pruning archive cycle older than 10 runs: {old_cycle}")
         shutil.rmtree(old_path, ignore_errors=True)
-all_cycles = all_cycles[:10]
+all_cycles = all_cycles[:6]
 
 manifest = {
     "latest": all_cycles[0],
