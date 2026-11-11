@@ -27,7 +27,10 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 OUTPUT_DIR = "output"
 RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
+CACHE_GRIDS_DIR = "backend_grids"  # Stored outside output/ to prevent Pages artifact bloat
+
 os.makedirs(RUNS_DIR, exist_ok=True)
+os.makedirs(CACHE_GRIDS_DIR, exist_ok=True)
 
 # 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
@@ -115,7 +118,8 @@ current_cycle_id = date_dt.strftime('%Y%m%d_%H')
 CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
 CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
 CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
-CURRENT_GRIDS_DIR = os.path.join(CURRENT_RUN_DIR, "grids")
+CURRENT_GRIDS_DIR = os.path.join(CACHE_GRIDS_DIR, current_cycle_id)
+
 os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
@@ -144,6 +148,7 @@ if os.path.exists(sample_f000):
             print(f"⚠️ Run {current_cycle_id} is incomplete or missing grid files (IFS: {ifs_mems_count}, Grids: {all_grids_exist}).")
             print("🔄 Purging this run folder so it cleanly re-downloads and populates...")
             shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
+            shutil.rmtree(CURRENT_GRIDS_DIR, ignore_errors=True)
             os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
             os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
             os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
@@ -158,6 +163,7 @@ if os.path.exists(sample_f000):
     except Exception as e:
         print(f"⚠️ Error verifying cached cycle: {e}. Purging directory to re-download.")
         shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
+        shutil.rmtree(CURRENT_GRIDS_DIR, ignore_errors=True)
         os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
         os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
         os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
@@ -733,7 +739,7 @@ if not skip_download_and_generation:
         # 5. Spread Diagnostics
         spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-        # 6. Save compact 2D grids for trend calculations (inside output/runs/<id>/grids/)
+        # 6. Save compact 2D grids for trend calculations (outside output/ inside backend_grids/)
         if super_mean is not None and spread_diags['inter'] is not None:
             np.savez_compressed(
                 os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
@@ -772,7 +778,11 @@ if not skip_download_and_generation:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    past_npz_path = os.path.join(CACHE_GRIDS_DIR, past_id, f"f{past_fxx:03d}.npz")
+                    if not os.path.exists(past_npz_path):
+                        past_npz_path_legacy = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                        if os.path.exists(past_npz_path_legacy):
+                            past_npz_path = past_npz_path_legacy
                     if os.path.exists(past_npz_path):
                         with np.load(past_npz_path) as data:
                             past_means.append(data['super_mean'])
@@ -854,7 +864,11 @@ else:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    past_npz_path = os.path.join(CACHE_GRIDS_DIR, past_id, f"f{past_fxx:03d}.npz")
+                    if not os.path.exists(past_npz_path):
+                        past_npz_path_legacy = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                        if os.path.exists(past_npz_path_legacy):
+                            past_npz_path = past_npz_path_legacy
                     if os.path.exists(past_npz_path):
                         with np.load(past_npz_path) as pdata:
                             past_means.append(pdata['super_mean'])
@@ -885,21 +899,23 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 9. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 6 RUNS = ~380MB)
+# 9. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 5 RUNS = ~320MB)
 # ==============================================================================
-print("\n🗄️ Managing 6-Run Archive...")
+print("\n🗄️ Managing 5-Run Archive...")
 all_cycles = sorted(
     [d for d in os.listdir(RUNS_DIR) if os.path.isdir(os.path.join(RUNS_DIR, d))],
     reverse=True
 )
 
-# Keep the 6 most recent runs with full PNGs to stay comfortably under GitHub's 1GB limit
-if len(all_cycles) > 6:
-    for old_cycle in all_cycles[6:]:
+# Prune runs older than 5 cycles from both output/runs and backend_grids
+if len(all_cycles) > 5:
+    for old_cycle in all_cycles[5:]:
         old_path = os.path.join(RUNS_DIR, old_cycle)
-        print(f"  🗑️ Pruning archive cycle older than 6 runs: {old_cycle}")
+        old_grid_path = os.path.join(CACHE_GRIDS_DIR, old_cycle)
+        print(f"  🗑️ Pruning archive cycle older than 5 runs: {old_cycle}")
         shutil.rmtree(old_path, ignore_errors=True)
-all_cycles = all_cycles[:6]
+        shutil.rmtree(old_grid_path, ignore_errors=True)
+all_cycles = all_cycles[:5]
 
 manifest = {
     "latest": all_cycles[0],
@@ -929,7 +945,7 @@ html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>500 hPa Multi-Ensemble Interactive Viewer</title>
+  <title>500mb Multi-Ensemble Interactive Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     :root {{
@@ -1096,7 +1112,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle">Multi-Cycle Operational Trend Analysis (6-Run Rolling Archive)</div>
+    <div class="subtitle">Multi-Cycle Operational Trend Analysis (5-Run Rolling Archive)</div>
   </div>
 
   <div class="toolbar">
