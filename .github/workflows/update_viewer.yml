@@ -12,7 +12,6 @@ permissions:
   contents: read
   pages: write
   id-token: write
-  actions: read  # Required for gh run download to access past artifacts
 
 concurrency:
   group: 'pages'
@@ -62,31 +61,6 @@ jobs:
           key: viewer-archive-${{ github.run_id }}
           restore-keys: |
             viewer-archive-
-
-      # =========================================================================
-      # ONE-TIME ARCHIVE RECOVERY STEP
-      # =========================================================================
-      - name: One-Time Archive Recovery
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Replace this number with your copied run ID from yesterday evening
-          PAST_RUN_ID="42929944349"
-          
-          echo "📥 Fetching artifact from Run ID: $PAST_RUN_ID..."
-          mkdir -p /tmp/recovered /tmp/extracted output/runs backend_grids
-
-          gh run download "$PAST_RUN_ID" -n github-pages --dir /tmp/recovered
-          tar -xf /tmp/recovered/artifact.tar -C /tmp/extracted
-
-          # Restore all past cycle folders (data, spread, and consensus metrics)
-          if [ -d "/tmp/extracted/runs" ]; then
-            cp -rn /tmp/extracted/runs/* output/runs/ 2>/dev/null || true
-            echo "✅ Successfully restored cycle runs into output/runs/:"
-            ls -l output/runs/
-          else
-            echo "⚠️ No /runs directory found in the extracted artifact."
-          fi
 
       - name: Run 500mb Generator
         run: |
