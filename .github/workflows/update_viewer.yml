@@ -12,6 +12,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read # Added so it can fetch past artifacts
 
 concurrency:
   group: 'pages'
@@ -51,6 +52,46 @@ jobs:
           key: viewer-archive-${{ github.run_id }}
           restore-keys: |
             viewer-archive-
+
+      # =========================================================================
+      # ONE-TIME RECOVERY STEP (REPLACE THE RUN ID BELOW)
+      # =========================================================================
+      - name: One-Time Archive Recovery
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PAST_RUN_ID="42929944349"
+          echo "📥 Downloading artifact from run $PAST_RUN_ID..."
+          mkdir -p /tmp/recovered /tmp/extracted output/runs backend_grids
+          
+          gh run download $PAST_RUN_ID -n github-pages --dir /tmp/recovered
+          tar -xf /tmp/recovered/artifact.tar -C /tmp/extracted
+          
+          # Copy previous cycles into output/runs
+          cp -rn /tmp/extracted/runs/* output/runs/ 2>/dev/null || true
+          
+          # Extract historical .npz grids into backend_grids for multi-run trends
+          for d in /tmp/extracted/runs/*; do
+            if [ -d "$d/grids" ]; then
+              cycle=$(basename "$d")
+              mkdir -p "backend_grids/$cycle"
+              cp -rn "$d/grids/"* "backend_grids/$cycle/" 2>/dev/null || true
+            fi
+          done
+          
+          echo "✅ Successfully recovered cycles: $(ls output/runs)"
+
+      - name: Run 500mb Generator
+        run: |
+          python generate_viewer.py
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: output
 
       - name: Run 500mb Generator
         run: |
