@@ -27,10 +27,7 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 OUTPUT_DIR = "output"
 RUNS_DIR = os.path.join(OUTPUT_DIR, "runs")
-# Store backend NPZ grids OUTSIDE the output/ folder so they are not uploaded to Pages
-GRIDS_CACHE_DIR = "backend_grids"
 os.makedirs(RUNS_DIR, exist_ok=True)
-os.makedirs(GRIDS_CACHE_DIR, exist_ok=True)
 
 # 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
@@ -118,26 +115,14 @@ current_cycle_id = date_dt.strftime('%Y%m%d_%H')
 CURRENT_RUN_DIR = os.path.join(RUNS_DIR, current_cycle_id)
 CURRENT_DATA_DIR = os.path.join(CURRENT_RUN_DIR, "data")
 CURRENT_SPREAD_DIR = os.path.join(CURRENT_RUN_DIR, "spread")
-CURRENT_GRIDS_DIR = os.path.join(GRIDS_CACHE_DIR, current_cycle_id)
+CURRENT_GRIDS_DIR = os.path.join(CURRENT_RUN_DIR, "grids")
 os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
 os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
 os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
-# Auto-migrate any legacy NPZ grids from output/runs/ to backend_grids/
-if os.path.exists(RUNS_DIR):
-    for c_dir in os.listdir(RUNS_DIR):
-        legacy_grids = os.path.join(RUNS_DIR, c_dir, "grids")
-        if os.path.isdir(legacy_grids):
-            target_dir = os.path.join(GRIDS_CACHE_DIR, c_dir)
-            os.makedirs(target_dir, exist_ok=True)
-            for fn in os.listdir(legacy_grids):
-                if fn.endswith(".npz"):
-                    shutil.copy2(os.path.join(legacy_grids, fn), os.path.join(target_dir, fn))
-            shutil.rmtree(legacy_grids, ignore_errors=True)
-
 
 # ==============================================================================
-# 3. AUTO-HEALTH CHECK (PURGES INCOMPLETE RUNS MISSING IFS)
+# 3. AUTO-HEALTH CHECK (PURGES INCOMPLETE RUNS MISSING IFS OR NPZ GRIDS)
 # ==============================================================================
 skip_download_and_generation = False
 sample_f000 = os.path.join(CURRENT_DATA_DIR, "f000.json")
@@ -152,11 +137,12 @@ if os.path.exists(sample_f000):
         
         all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
         all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
+        all_grids_exist = all(os.path.exists(os.path.join(CURRENT_GRIDS_DIR, f"f{f:03d}.npz")) for f in FXX_STEPS)
         metrics_file = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
         
-        if ifs_mems_count == 0 or ecmwf_det_empty:
-            print(f"⚠️ Detected cached run {current_cycle_id} is missing ECMWF IFS data ({ifs_mems_count} members).")
-            print("🔄 Purging this corrupted run folder so it properly re-downloads...")
+        if ifs_mems_count == 0 or ecmwf_det_empty or not all_grids_exist:
+            print(f"⚠️ Run {current_cycle_id} is incomplete or missing grid files (IFS: {ifs_mems_count}, Grids: {all_grids_exist}).")
+            print("🔄 Purging this run folder so it cleanly re-downloads and populates...")
             shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
             os.makedirs(CURRENT_DATA_DIR, exist_ok=True)
             os.makedirs(CURRENT_SPREAD_DIR, exist_ok=True)
@@ -394,7 +380,7 @@ def fetch_aifs_ensemble(fxx):
                     var_key = list(ds.data_vars)[0]
                     da = ds[var_key].squeeze()
                     dim_names = list(da.dims)
-                    if any(d in dim_names for d in ['number', 'realization']):
+                    if any(dim in dim_names for dim in ['number', 'realization']):
                         m_dim = 'number' if 'number' in dim_names else 'realization'
                         for m_idx in range(len(da[m_dim])):
                             g = standardize_grid(da.isel({m_dim: m_idx}).to_dataset(name=var_key))
@@ -495,7 +481,6 @@ def compute_consensus_metrics(model_grid, super_mean):
     if model_grid is None or super_mean is None or np.all(np.isnan(model_grid)) or np.all(np.isnan(super_mean)):
         return {"r": None, "rmsd": None, "score": None}
     try:
-        # Subtract the zonal mean across longitudes for each latitude row (axis=1)
         m_eddy = model_grid - np.nanmean(model_grid, axis=1, keepdims=True)
         s_eddy = super_mean - np.nanmean(super_mean, axis=1, keepdims=True)
         
@@ -748,7 +733,7 @@ if not skip_download_and_generation:
         # 5. Spread Diagnostics
         spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
 
-        # 6. Save compact 2D grids for trend calculations
+        # 6. Save compact 2D grids for trend calculations (inside output/runs/<id>/grids/)
         if super_mean is not None and spread_diags['inter'] is not None:
             np.savez_compressed(
                 os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz"),
@@ -787,14 +772,8 @@ if not skip_download_and_generation:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    candidate_paths = [
-                        os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz"),
-                        os.path.join(GRIDS_CACHE_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
-                        os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
-                        os.path.join(RUNS_DIR, past_id, f"f{past_fxx:03d}.npz")
-                    ]
-                    past_npz_path = next((p for p in candidate_paths if os.path.exists(p)), None)
-                    if past_npz_path:
+                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    if os.path.exists(past_npz_path):
                         with np.load(past_npz_path) as data:
                             past_means.append(data['super_mean'])
                             past_spr_inters.append(data['spr_inter'])
@@ -859,12 +838,8 @@ else:
     )
     for fxx in FXX_STEPS:
         valid_time = date_dt + timedelta(hours=fxx)
-        cur_candidates = [
-            os.path.join(GRIDS_CACHE_DIR, current_cycle_id, f"f{fxx:03d}.npz"),
-            os.path.join(RUNS_DIR, current_cycle_id, "grids", f"f{fxx:03d}.npz")
-        ]
-        cur_npz = next((p for p in cur_candidates if os.path.exists(p)), None)
-        if not cur_npz:
+        cur_npz = os.path.join(CURRENT_GRIDS_DIR, f"f{fxx:03d}.npz")
+        if not os.path.exists(cur_npz):
             continue
 
         with np.load(cur_npz) as cdata:
@@ -879,15 +854,9 @@ else:
                 past_dt = datetime.strptime(past_id, "%Y%m%d_%H")
                 past_fxx = int(round((valid_time - past_dt).total_seconds() / 3600))
                 if 0 <= past_fxx <= 240 and past_fxx % 12 == 0:
-                    cand_paths = [
-                        os.path.join(GRIDS_CACHE_DIR, past_id, f"f{past_fxx:03d}.npz"),
-                        os.path.join(GRIDS_CACHE_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
-                        os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz"),
-                        os.path.join(RUNS_DIR, past_id, f"f{past_fxx:03d}.npz")
-                    ]
-                    p_path = next((p for p in cand_paths if os.path.exists(p)), None)
-                    if p_path:
-                        with np.load(p_path) as pdata:
+                    past_npz_path = os.path.join(RUNS_DIR, past_id, "grids", f"f{past_fxx:03d}.npz")
+                    if os.path.exists(past_npz_path):
+                        with np.load(past_npz_path) as pdata:
                             past_means.append(pdata['super_mean'])
                             past_spr_inters.append(pdata['spr_inter'])
             except Exception:
@@ -916,18 +885,19 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 9. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 10 RUNS)
+# 9. ARCHIVE PRUNING & MANIFEST GENERATION (ROLLING 6 RUNS = ~380MB)
 # ==============================================================================
-print("\n🗄️ Managing 10-Run Archive...")
+print("\n🗄️ Managing 6-Run Archive...")
 all_cycles = sorted(
     [d for d in os.listdir(RUNS_DIR) if os.path.isdir(os.path.join(RUNS_DIR, d))],
     reverse=True
 )
 
-# Keep the 5 most recent runs with full PNGs to stay comfortably under GitHub's 1GB limit
+# Keep the 6 most recent runs with full PNGs to stay comfortably under GitHub's 1GB limit
 if len(all_cycles) > 6:
     for old_cycle in all_cycles[6:]:
         old_path = os.path.join(RUNS_DIR, old_cycle)
+        print(f"  🗑️ Pruning archive cycle older than 6 runs: {old_cycle}")
         shutil.rmtree(old_path, ignore_errors=True)
 all_cycles = all_cycles[:6]
 
@@ -959,7 +929,7 @@ html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>500mb Multi-Ensemble Interactive Viewer</title>
+  <title>500 hPa Multi-Ensemble Interactive Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     :root {{
@@ -1126,7 +1096,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>500 hPa Multi-Ensemble & Deterministic Spaghetti Viewer</h2>
-    <div class="subtitle">Multi-Cycle Operational Trend Analysis (10-Run Archive)</div>
+    <div class="subtitle">Multi-Cycle Operational Trend Analysis (6-Run Rolling Archive)</div>
   </div>
 
   <div class="toolbar">
