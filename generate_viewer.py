@@ -49,18 +49,33 @@ http_session.headers.update({"User-Agent": "Mozilla/5.0 (500mb-ensemble-viewer; 
 
 
 # ==============================================================================
-# 2. DYNAMIC CYCLE DETECTOR (WITH PINNED 0p25 ECMWF RESOLUTION)
+# 2. DYNAMIC CYCLE DETECTOR (STRICT FULL-ENSEMBLE F240 VERIFICATION)
 # ==============================================================================
 def probe_ifs_availability(cycle_str):
-    """Verifies that ECMWF IFS 0p25 has both GRIB and index file available at F240."""
-    try:
-        H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240, resolution="0p25")
-        if H_ifs.grib is not None:
-            return True
-        H_det = Herbie(cycle_str, model="ifs", product="oper", fxx=240, resolution="0p25")
-        return H_det.grib is not None
-    except Exception:
-        return False
+    """Verifies that the full 51-member ECMWF IFS ensemble (0p25) is indexed out to F240."""
+    for check_fxx in [192, 240]:
+        try:
+            H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=check_fxx, resolution="0p25")
+            if H_ifs.grib is None or H_ifs.idx is None:
+                return False
+
+            # Verify all 51 ensemble members (1 cf + 50 pf) are present in the index
+            member_count = 0
+            for sq in [":gh:500", ":gh:500:", ":z:500:"]:
+                try:
+                    inv = H_ifs.inventory(sq)
+                    if inv is not None and len(inv) > 0:
+                        member_count = len(inv)
+                        break
+                except Exception:
+                    continue
+
+            if member_count < 50:
+                print(f"    ↳ IFS enfo F{check_fxx:03d} only has {member_count}/51 members indexed yet.")
+                return False
+        except Exception:
+            return False
+    return True
 
 def probe_aigefs_availability(cand):
     date_nomads = cand.strftime('%Y%m%d')
@@ -96,7 +111,7 @@ def detect_latest_complete_cycle():
         
         ifs_ready = probe_ifs_availability(cycle_str)
         if not ifs_ready:
-            print(f"    ↳ ECMWF IFS F240 (0p25) not complete for {cycle_str}Z.")
+            print(f"    ↳ ECMWF IFS ensemble (0p25) not complete through F240 for {cycle_str}Z.")
             continue
             
         aigefs_ready = probe_aigefs_availability(cand)
@@ -126,26 +141,33 @@ os.makedirs(CURRENT_GRIDS_DIR, exist_ok=True)
 
 
 # ==============================================================================
-# 3. AUTO-HEALTH CHECK (PURGES INCOMPLETE RUNS MISSING IFS OR NPZ GRIDS)
+# 3. AUTO-HEALTH CHECK (PURGES PARTIAL RUNS MISSING IFS MEMBERS OR GRIDS)
 # ==============================================================================
 skip_download_and_generation = False
 sample_f000 = os.path.join(CURRENT_DATA_DIR, "f000.json")
+sample_f240 = os.path.join(CURRENT_DATA_DIR, "f240.json")
 
 if os.path.exists(sample_f000):
     try:
         with open(sample_f000, "r") as f:
             sample_data = json.load(f)
-            
-        ifs_mems_count = len(sample_data.get("ifs_members", []))
+
+        ifs_mems_f000 = len(sample_data.get("ifs_members", []))
         ecmwf_det_empty = not bool(sample_data.get("ecmwf_det", {}))
-        
+
+        ifs_mems_f240 = 0
+        if os.path.exists(sample_f240):
+            with open(sample_f240, "r") as f240:
+                sample_data_240 = json.load(f240)
+                ifs_mems_f240 = len(sample_data_240.get("ifs_members", []))
+
         all_json_exist = all(os.path.exists(os.path.join(CURRENT_DATA_DIR, f"f{f:03d}.json")) for f in FXX_STEPS)
         all_png_exist = all(os.path.exists(os.path.join(CURRENT_SPREAD_DIR, f"total_f{f:03d}.png")) for f in FXX_STEPS)
         all_grids_exist = all(os.path.exists(os.path.join(CURRENT_GRIDS_DIR, f"f{f:03d}.npz")) for f in FXX_STEPS)
         metrics_file = os.path.join(CURRENT_RUN_DIR, "consensus_metrics.json")
-        
-        if ifs_mems_count == 0 or ecmwf_det_empty or not all_grids_exist:
-            print(f"⚠️ Run {current_cycle_id} is incomplete or missing grid files (IFS: {ifs_mems_count}, Grids: {all_grids_exist}).")
+
+        if ifs_mems_f000 < 50 or ifs_mems_f240 < 50 or ecmwf_det_empty or not all_grids_exist:
+            print(f"⚠️ Run {current_cycle_id} is incomplete (IFS F000: {ifs_mems_f000}, IFS F240: {ifs_mems_f240}, Grids: {all_grids_exist}).")
             print("🔄 Purging this run folder so it cleanly re-downloads and populates...")
             shutil.rmtree(CURRENT_RUN_DIR, ignore_errors=True)
             shutil.rmtree(CURRENT_GRIDS_DIR, ignore_errors=True)
