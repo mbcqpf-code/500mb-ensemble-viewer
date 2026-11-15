@@ -1253,8 +1253,8 @@ html_content = f"""<!DOCTYPE html>
         </span>
         <label class="checkbox-item"><input type="checkbox" id="chk_gfs" checked onchange="draw()"><span class="swatch" style="background:#001155; border-bottom: 2px dashed #fff;"></span> GFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigfs" checked onchange="draw()"><span class="swatch" style="background:#4a235a; border-bottom: 2px dashed #fff;"></span> AIGFS Det</label>
-        <label class="checkbox-item"><input type="checkbox" id="chk_ecmwf_det" onchange="draw()"><span class="swatch" style="background:#78281f; border-bottom: 2px dashed #fff;"></span> IFS Det</label>
-        <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"><span class="swatch" style="background:#145a32; border-bottom: 2px dashed #fff;"></span> AIFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_ecmwf_det" checked onchange="draw()"><span class="swatch" style="background:#78281f; border-bottom: 2px dashed #fff;"></span> IFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" checked onchange="draw()"><span class="swatch" style="background:#145a32; border-bottom: 2px dashed #fff;"></span> AIFS Det</label>
       </div>
     </div>
 
@@ -1312,7 +1312,7 @@ html_content = f"""<!DOCTYPE html>
     const ALL_CONTOURS = {ALL_CONTOURS};
     const STANDARD_CONTOURS = [5400, 5520, 5640, 5760, 5880];
     const FXX_STEPS = {FXX_STEPS};
-    let selectedContours = new Set(ALL_CONTOURS);
+    let selectedContours = new Set(STANDARD_CONTOURS);
     let dataCache = {{}};
     let consensusDataCache = {{}};
     let currentStepData = null;
@@ -1455,7 +1455,7 @@ html_content = f"""<!DOCTYPE html>
     const chipContainer = document.getElementById('contourChips');
     ALL_CONTOURS.forEach(lvl => {{
       const chip = document.createElement('div');
-      chip.className = 'chip active';
+      chip.className = selectedContours.has(lvl) ? 'chip active' : 'chip';
       chip.id = `chip_${{lvl}}`;
       chip.textContent = lvl;
       chip.onclick = () => toggleContour(lvl);
@@ -1853,15 +1853,16 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
+    // High-contrast palette tuned specifically for the dark (#0b1120) Consensus Tracker canvas
     const MODEL_STYLES = {{
-      'gefs_mean':   {{ label: 'GEFS Mean', color: '#0044ff', dash: [] }},
-      'aigefs_mean': {{ label: 'AIGEFS Mean', color: '#8e44ad', dash: [] }},
-      'ifs_mean':    {{ label: 'IFS Mean', color: '#d63031', dash: [] }},
-      'aifs_mean':   {{ label: 'AIFS Mean', color: '#00b894', dash: [] }},
-      'gfs_det':     {{ label: 'GFS Det', color: '#001155', dash: [5, 3] }},
-      'aigfs_det':   {{ label: 'AIGFS Det', color: '#4a235a', dash: [5, 3] }},
-      'ecmwf_det':   {{ label: 'IFS Det', color: '#78281f', dash: [5, 3] }},
-      'aifs_det':    {{ label: 'AIFS Det', color: '#145a32', dash: [5, 3] }}
+      'gefs_mean':   {{ label: 'GEFS Mean', color: '#2563eb', dash: [] }},
+      'aigefs_mean': {{ label: 'AIGEFS Mean', color: '#a855f7', dash: [] }},
+      'ifs_mean':    {{ label: 'IFS Mean', color: '#ef4444', dash: [] }},
+      'aifs_mean':   {{ label: 'AIFS Mean', color: '#10b981', dash: [] }},
+      'gfs_det':     {{ label: 'GFS Det', color: '#7dd3fc', dash: [5, 3] }},
+      'aigfs_det':   {{ label: 'AIGFS Det', color: '#d8b4fe', dash: [5, 3] }},
+      'ecmwf_det':   {{ label: 'IFS Det', color: '#fca5a5', dash: [5, 3] }},
+      'aifs_det':    {{ label: 'AIFS Det', color: '#86efac', dash: [5, 3] }}
     }};
 
     async function openConsensusModal() {{
@@ -1999,7 +2000,7 @@ html_content = f"""<!DOCTYPE html>
       modelKeys.forEach(mKey => {{
         const style = MODEL_STYLES[mKey];
         ctx.strokeStyle = style.color;
-        ctx.lineWidth = style.dash.length ? 1.8 : 2.4;
+        ctx.lineWidth = style.dash.length ? 2.0 : 2.4;
         ctx.setLineDash(style.dash);
         ctx.beginPath();
         let started = false;
@@ -2029,9 +2030,12 @@ html_content = f"""<!DOCTYPE html>
       const legEl = document.getElementById('modalLegend');
       legEl.innerHTML = modelKeys.map(k => {{
         const s = MODEL_STYLES[k];
+        const sampleStyle = s.dash.length
+          ? `width:20px; height:0; border-top:2.5px dashed ${{s.color}}; display:inline-block;`
+          : `width:20px; height:3px; background:${{s.color}}; display:inline-block;`;
         return `
           <div style="display:flex; align-items:center; gap:6px;">
-            <span style="width:18px; height:3px; background:${{s.color}}; display:inline-block; border-bottom:${{s.dash.length ? '2px dashed #000' : 'none'}};"></span>
+            <span style="${{sampleStyle}}"></span>
             <span>${{s.label}}</span>
           </div>
         `;
