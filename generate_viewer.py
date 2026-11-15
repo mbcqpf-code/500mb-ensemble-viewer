@@ -1077,9 +1077,9 @@ html_content = f"""<!DOCTYPE html>
       background: #475569; color: #ffffff;
     }}
     .tooltip-card {{
-      display: none; position: absolute; top: 30px; right: 0; width: 320px;
+      display: none; position: absolute; top: 30px; right: 0; width: 330px;
       background: #0f172a; border: 1px solid #475569; border-radius: 8px;
-      padding: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); z-index: 100;
+      padding: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); z-index: 200;
       color: #e2e8f0; font-size: 12px; line-height: 1.4;
     }}
     .tooltip-card.show {{
@@ -1182,12 +1182,12 @@ html_content = f"""<!DOCTYPE html>
         </select>
 
         <div class="tooltip-container">
-          <button class="info-btn" id="infoBtn" onclick="toggleTooltip(event)" title="Click to view explanation of this underlay">ℹ</button>
+          <button class="info-btn" id="infoBtn" onclick="toggleTooltip(event, 'tooltipCard')" title="Click to view explanation of this underlay">ℹ</button>
           <div class="tooltip-card" id="tooltipCard">
             <div class="tooltip-title" id="ttTitle">Diagnostic Info</div>
             <div id="ttDesc">Description</div>
             <div class="tooltip-section"><b>Color Guide:</b> <span id="ttColors">Colors</span></div>
-            <div class="tooltip-section"><b>Desk Action:</b> <span id="ttAction">Action</span></div>
+            <div class="tooltip-section"><b>Forecast Context:</b> <span id="ttAction">Context</span></div>
           </div>
         </div>
 
@@ -1219,8 +1219,19 @@ html_content = f"""<!DOCTYPE html>
         <label><input type="radio" name="displayMode" value="means" onchange="draw()"> Means Only</label>
       </div>
 
-      <div style="display: flex; gap: 8px; align-items: center;">
+      <div style="display: flex; gap: 6px; align-items: center;">
         <button class="btn" style="background: #2563eb;" onclick="openConsensusModal()" title="View lead-time consensus tracking charts for all models">📈 Consensus Tracker</button>
+        <div class="tooltip-container">
+          <button class="info-btn" onclick="toggleTooltip(event, 'consensusTooltipCard')" title="Click to view explanation of Consensus Tracker and legend scores">ℹ</button>
+          <div class="tooltip-card" id="consensusTooltipCard" style="width: 350px;">
+            <div class="tooltip-title">Consensus Tracker & Legend Metrics</div>
+            <div>Evaluates each model against the <b>164-member Superensemble Mean</b> across F000–F240 to diagnose wave-pattern clustering, amplitude departure, and tail outliers.</div>
+            <div class="tooltip-section"><b>Composite Score [XX%]:</b> Weighted blend of 60% zonal eddy correlation (<i>r</i>) and 40% normalized height <i>RMSD</i>.</div>
+            <div class="tooltip-section"><b>r (Zonal Eddy Corr.):</b> Pattern correlation with latitudinal means removed—isolates trough/ridge phase and tilt.</div>
+            <div class="tooltip-section"><b>±RMSD (m):</b> Spatial root-mean-square height difference—captures wave depth and height bias.</div>
+            <div class="tooltip-section"><b>Legend Medal (🥇):</b> Marks the highest-scoring active layer at the selected lead time.</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1321,114 +1332,116 @@ html_content = f"""<!DOCTYPE html>
     const UNDERLAY_INFO = {{
       'none': {{
         title: 'Basemap Only (Clean)',
-        desc: 'Standard Lambert Conformal basemap with state and coastline features. Leaves the canvas clean for spaghetti contour analysis.',
+        desc: 'Standard Lambert Conformal basemap with state and coastline boundaries.',
         colors: 'Neutral terrain styling.',
-        action: 'Ideal for unencumbered inspection of tight contour clusters or manual wave tracking.',
+        action: 'Provides an uncluttered background for inspecting individual spaghetti members and wave geometry.',
         summary: 'Clean basemap with interactive vector contours on top.'
       }},
       'outlier_ens': {{
         title: 'Ensemble Mean Outliers (3-vs-1 Isolation)',
-        desc: 'Flags when a single ensemble mean breaks away from the other three systems, accounting for ≥60% of total inter-model variance with a departure of ≥25m.',
-        colors: 'Shaded by the rogue model color: Blue (GEFS), Purple (AIGEFS), Red (IFS), Green (AIFS).',
-        action: 'Treat the flagged model with skepticism if the other 3 agree. If blank, models are either clustered or locked in a 2-vs-2 split.',
+        desc: 'Highlights regions where one ensemble mean accounts for ≥60% of total inter-model variance with a ≥25m departure from the other three suites.',
+        colors: 'Shaded by the isolated ensemble suite: Blue (GEFS), Purple (AIGEFS), Red (IFS), Green (AIFS).',
+        action: 'Indicates when a single modeling center is driving most of the inter-model spread. Blank areas reflect either broad clustering or a balanced split (e.g., 2-vs-2).',
         summary: 'Highlights lone-wolf ensemble means that deviate sharply from the other 3 systems.'
       }},
       'outlier_det': {{
         title: 'Deterministic Outliers (|Z| ≥ 2.0σ)',
-        desc: 'Identifies operational deterministic runs that sit in the extreme tails (≥2 standard deviations) relative to the 164-member superensemble spread.',
-        colors: 'Dominant outlier gets solid color fill (Navy: GFS, Purple: AIGFS, Red: IFS, Green: AIFS). Dashed contours indicate co-outliers.',
-        action: 'Avoid anchoring your forecast to a single deterministic run when it is flagged as an outlier.',
+        desc: 'Identifies operational deterministic runs sitting in the outer tails (≥2σ) of the 164-member superensemble distribution.',
+        colors: 'Dominant outlier gets solid fill (Navy: GFS, Purple: AIGFS, Red: IFS, Green: AIFS); dashed contours indicate secondary co-outliers.',
+        action: 'Helps gauge when a deterministic solution sits near the edge of the ensemble envelope versus near the core clustering.',
         summary: 'Highlights operational deterministic runs falling outside the 164-member ensemble envelope.'
       }},
       'inter': {{
         title: 'Inter-Model Disagreement (σ_inter)',
-        desc: 'Standard deviation between the 4 ensemble means (GEFS, AIGEFS, IFS, AIFS). Isolates structural synoptic differences between modeling centers.',
+        desc: 'Standard deviation across the 4 ensemble means (GEFS, AIGEFS, IFS, AIFS), isolating structural differences between modeling centers.',
         colors: 'Yellow to Dark Red (10m to 120m+ spread among ensemble means).',
-        action: 'High values flag a "Model War" or synoptic bifurcation. Do not blend or trust the Super Mean here.',
-        summary: 'Measures disagreement among the 4 ensemble means. High bullseyes indicate a Model War.'
+        action: 'Pinpoints regions of synoptic bifurcation or phase/amplitude disagreement across suites where the grand mean may smooth out distinct scenarios.',
+        summary: 'Measures disagreement among the 4 ensemble means, highlighting structural model differences.'
       }},
       'physics_vs_ai': {{
         title: 'Physics minus AI (Phys - AI)',
-        desc: 'Difference between the pooled traditional physics mean (GEFS + IFS) and the pooled AI emulator mean (AIGEFS + AIFS).',
+        desc: 'Height difference between the pooled traditional physics mean (GEFS + IFS) and the pooled ML emulator mean (AIGEFS + AIFS).',
         colors: 'Red (+10 to +80m): Physics higher / AI deeper. Blue (-10 to -80m): AI higher / Physics deeper.',
-        action: 'Reveals whether differences are driven by AI smoothing of PV anomalies or physics convective feedbacks.',
+        action: 'Helps diagnose whether model spread stems from systematic differences between NWP physics (e.g., convective/diabatic feedbacks) and ML emulators.',
         summary: 'Compares Physics ensembles (GEFS+IFS) against Deep-Learning AI ensembles (AIGEFS+AIFS).'
       }},
       'monotonic_trend': {{
         title: '4-Run Monotonic Trend (Deepening vs Building)',
-        desc: 'Measures persistent, directional height changes across the last 4 consecutive runs (0h, -12h, -24h, -36h) for this identical valid time.',
-        colors: 'Blue (-20 to -80m): Steady multi-run deepening trough. Red (+20 to +80m): Steady multi-run building ridge.',
-        action: 'Confirms a genuine synoptic trend across shifts rather than single-run model noise.',
+        desc: 'Measures directional height consistency across the last 4 consecutive cycles (0h, -12h, -24h, -36h) for this valid time.',
+        colors: 'Blue (-20 to -80m): Persistent multi-run height falls. Red (+20 to +80m): Persistent multi-run height rises.',
+        action: 'Helps separate steady run-to-run synoptic adjustments across cycles from single-run variability.',
         summary: 'Shows where models have consistently trended deeper (blue) or stronger (red) over 4 cycles.'
       }},
       'flipflop': {{
         title: '4-Run Flip-Flop Volatility (Oscillation Energy)',
-        desc: 'Calculates path-length hunting: identifies regions where guidance has bounced back and forth across consecutive shifts without settling on a solution.',
-        colors: 'Yellow to Red (10m to 80m+ of oscillating volatility).',
-        action: 'Do not chase the latest run inside a bright bullseye; guidance is unstable.',
-        summary: 'Warns of "washing machine" zones where models are alternating between deeper and weaker.'
+        desc: 'Quantifies cumulative path-length reversals where cycle-to-cycle height guidance has alternated direction without settling.',
+        colors: 'Yellow to Red (10m to 80m+ of oscillating run-to-run volatility).',
+        action: 'Identifies regions of lower cycle-to-cycle stability where consecutive runs have bounced back and forth.',
+        summary: 'Highlights zones where consecutive cycles have alternated between deeper and weaker solutions.'
       }},
       'convergence': {{
         title: 'Model Convergence Rate (Δσ_inter)',
-        desc: 'Compares inter-model disagreement now versus 12 hours ago for this valid time.',
-        colors: 'Green (-30m): Models converging into consensus. Purple (+30m): Models diverging further apart.',
-        action: 'Green indicates growing confidence. Purple flags an emerging synoptic bifurcation.',
-        summary: 'Green shows models locking onto consensus; Purple flags an emerging model war.'
+        desc: 'Change in inter-model spread (σ_inter) compared to the previous 12-hour cycle for this valid time.',
+        colors: 'Green (-30m): Inter-model spread tightening. Purple (+30m): Inter-model spread expanding.',
+        action: 'Tracks whether the four ensemble suites are converging toward a shared synoptic solution or diverging further apart.',
+        summary: 'Green shows inter-model spread tightening; Purple shows suites diverging from the prior cycle.'
       }},
       'total': {{
         title: 'Total Superensemble Spread (σ_total)',
-        desc: 'Standard deviation across all 164 individual ensemble members pooled together. Measures the total atmospheric uncertainty envelope.',
+        desc: 'Standard deviation across all 164 individual ensemble members pooled together, combining internal and inter-model uncertainty.',
         colors: 'Yellow to Dark Red (10m to 120m+ spread across all members).',
-        action: 'Represents the big-picture confidence boundary for synoptic feature placement.',
+        action: 'Summarizes overall synoptic height uncertainty and feature-placement spread across the full multi-model envelope.',
         summary: 'Overall uncertainty envelope across all 164 members pooled together.'
       }},
       'intra_pooled': {{
         title: 'Pooled Internal Chaos (σ_intra)',
-        desc: 'Average standard deviation occurring internally inside each ensemble system. Measures sensitivity to initial conditions and chaotic dispersion.',
-        colors: 'Yellow to Dark Red (10m to 120m+ internal chaotic spread).',
-        action: 'High values mean internal wave timing or shortwave dispersion is chaotic.',
+        desc: 'Root-mean-square of the internal standard deviations within each of the 4 ensemble systems, isolating intrinsic predictability limits.',
+        colors: 'Yellow to Dark Red (10m to 120m+ internal ensemble spread).',
+        action: 'Distinguishes intrinsic shortwave/timing dispersion within individual ensembles from systematic differences between modeling centers.',
         summary: 'Average chaotic disagreement within each individual ensemble system.'
       }},
       'gefs': {{
         title: 'GEFS Spread',
-        desc: 'Internal standard deviation among the 31 physics-based GEFS members.',
-        colors: 'Yellow to Dark Red.',
-        action: 'Evaluates NCEP physics suite sensitivity.',
+        desc: 'Internal standard deviation among the 31 physics-based NCEP GEFS members.',
+        colors: 'Yellow to Dark Red (10m to 120m+).',
+        action: 'Assesses internal phase and amplitude dispersion within the NCEP physics ensemble.',
         summary: 'Internal spread among the 31 NCEP GEFS members.'
       }},
       'aigefs': {{
         title: 'AIGEFS Spread',
         desc: 'Internal standard deviation among the 31 NOAA AI-GEFS members.',
-        colors: 'Yellow to Dark Red.',
-        action: 'Evaluates NCEP AI suite dispersion.',
+        colors: 'Yellow to Dark Red (10m to 120m+).',
+        action: 'Assesses internal phase and amplitude dispersion within the NOAA ML ensemble.',
         summary: 'Internal spread among the 31 NOAA AIGEFS deep-learning members.'
       }},
       'ifs': {{
         title: 'ECMWF IFS Spread',
         desc: 'Internal standard deviation among the 51 ECMWF IFS members.',
-        colors: 'Yellow to Dark Red.',
-        action: 'Evaluates European physics suite dispersion.',
+        colors: 'Yellow to Dark Red (10m to 120m+).',
+        action: 'Assesses internal phase and amplitude dispersion within the ECMWF physics ensemble.',
         summary: 'Internal spread among the 51 ECMWF IFS members.'
       }},
       'aifs': {{
         title: 'AIFS Spread',
         desc: 'Internal standard deviation among the 51 ECMWF AIFS members.',
-        colors: 'Yellow to Dark Red.',
-        action: 'Evaluates European AI suite dispersion.',
+        colors: 'Yellow to Dark Red (10m to 120m+).',
+        action: 'Assesses internal phase and amplitude dispersion within the ECMWF ML ensemble.',
         summary: 'Internal spread among the 51 ECMWF AIFS deep-learning members.'
       }}
     }};
 
-    function toggleTooltip(e) {{
+    function toggleTooltip(e, cardId) {{
       e.stopPropagation();
-      const card = document.getElementById('tooltipCard');
-      card.classList.toggle('show');
+      const targetCard = document.getElementById(cardId);
+      document.querySelectorAll('.tooltip-card').forEach(card => {{
+        if (card.id !== cardId) card.classList.remove('show');
+      }});
+      if (targetCard) targetCard.classList.toggle('show');
     }}
 
     document.addEventListener('click', (e) => {{
-      const container = document.querySelector('.tooltip-container');
-      if (container && !container.contains(e.target)) {{
-        document.getElementById('tooltipCard').classList.remove('show');
+      if (!e.target.closest('.tooltip-container')) {{
+        document.querySelectorAll('.tooltip-card').forEach(card => card.classList.remove('show'));
       }}
     }});
 
